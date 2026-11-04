@@ -1,0 +1,22 @@
+# PyInstaller / build outputs
+build/
+dist/
+*.spec.bak
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+*.egg
+
+# Local / generated
+*.log
+.venv/
+venv/
+env/
+
+# App data / local config (user-specific)
+# (settings live under %APPDATA%\MSCHelper on Windows)
+
+# Launcher listed in release checklist
+run_autopot.bat

@@ -10,7 +10,8 @@ MSC Helper offers automatic potion and ability casting.
 1. Install the latest release from the [Releases](https://github.com/zgndia/MSC-Helper/releases) page.
 2. Install [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) for best accuracy (recommended).
 3. Run this one-line command to add Tesseract OCR to your path in powershell
-```[Environment]::SetEnvironmentVariable("Path", $env:Path + ";C:\Program Files\Tesseract-OCR", "User")```
+```cmd
+[Environment]::SetEnvironmentVariable("Path", $env:Path + ";C:\Program Files\Tesseract-OCR", "User")```
 4. Restart powershell and run `tesseract --version` to verify. If you can see your tesseract version, you are good to go.
 5. Launch `MSCHelper.exe` and MapleStory Classic.
 

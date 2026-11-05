@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1 — Overlay interaction & HUD read hotfix
+
+- Overlay can be dragged and resized again (no longer requires the internal “focused” flag).
+- Moving or resizing the overlay no longer flips status to “GAME IN BACKGROUND” or pauses HUD reads.
+- “GAME ACTIVE” / “GAME IN BACKGROUND” status on the overlay updates within ~200 ms instead of lagging 1–1.5 s.
+- Overlay is briefly hidden with a short compositor settle before each HUD capture so HP/MP template matching sees the real bars.
+- Potion logic ignores near-zero bar reads (ratio < 2 % or low confidence) that were caused by overlay pixels or partial frames, preventing stacks from being emptied on false zeros.
+- General tab: Game window and Enabled Command List are side-by-side; Activity log moved into General; separate Activity tab removed to reduce empty space.
+
 ## 0.2.0 — Auto-update, auto-cast sets, overlay polish
 
 - Focus must be held for a configurable duration (default 1000 ms) before any key is sent; focus is re-checked immediately before SendInput.

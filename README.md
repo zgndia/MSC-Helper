@@ -1,6 +1,6 @@
 # MSC Helper
 
-**Release:** `0.2.0`  
+**Release:** `0.2.1`  
 **MapleStory Classic Helper** — configurable input automation macro for MapleStory Classic
 
 ## Features

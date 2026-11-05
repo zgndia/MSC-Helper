@@ -64,7 +64,7 @@ else:
     DETECTOR_IMPORT_ERROR = None
 
 APP_NAME = "MSC Helper"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "MSCHelper"
 CONFIG_PATH = CONFIG_DIR / "settings.json"
@@ -289,7 +289,12 @@ def is_helper_under_cursor() -> bool:
     "focused" and monitoring would keep capturing. Treating helper-under-cursor
     as not game-focused stops HP/MP tracking while the user is on the overlay
     or the main GUI.
+
+    While the user is actively dragging/resizing the overlay we temporarily
+    ignore this check so status stays "GAME ACTIVE" and HUD reads continue.
     """
+    if _OVERLAY_INTERACTING:
+        return False
     if sys.platform != "win32" or _USER32 is None:
         return False
     try:
@@ -538,6 +543,9 @@ def find_target_windows(window_title_fragment: str) -> list[tuple[int, str, int]
 # focus switch is noticed quickly; input paths always invalidate + re-query.
 _FOCUS_CACHE: tuple[float, bool, str] = (0.0, False, "")
 _FOCUS_CACHE_TTL = 0.05  # seconds
+# Set while the user is dragging or resizing the live overlay so the
+# under-cursor check does not force "game in background" or block HUD reads.
+_OVERLAY_INTERACTING = False
 
 
 def is_target_focused(window_title_fragment: str, window_id: int = 0) -> tuple[bool, str]:
@@ -908,8 +916,9 @@ class MonitorWorker(threading.Thread):
 
     def _emit_telemetry(self, settings: Settings, focused: bool, movement_detected: bool = False) -> None:
         now = time.monotonic()
-        # Keep GUI/overlay updates infrequent so the Tk main thread stays free for buttons.
-        min_interval = 1.0 if not settings.overlay_enabled else 0.70
+        # Keep GUI/overlay updates responsive when the live overlay is on so
+        # "GAME ACTIVE" / "GAME IN BACKGROUND" flips promptly on focus change.
+        min_interval = 1.0 if not settings.overlay_enabled else 0.18
         if now - self._last_telemetry < min_interval:
             return
         self._last_telemetry = now
@@ -1108,6 +1117,10 @@ class MonitorWorker(threading.Thread):
                 for oh in overlays_to_hide:
                     show(ctypes.c_void_p(oh), 0)  # SW_HIDE
                     hidden_overlays.append(oh)
+                # Give the compositor a brief moment so mss does not capture
+                # residual overlay pixels (common cause of 0 HP/MP reads).
+                if hidden_overlays:
+                    time.sleep(0.008)
             except Exception:
                 hidden_overlays = []
         try:
@@ -1449,6 +1462,14 @@ class MonitorWorker(threading.Thread):
                     )
                     seed_focus_cache(focused, title or "")
 
+                    # Force a telemetry push on any focus edge so the overlay
+                    # status text updates within one poll instead of waiting
+                    # for the normal min_interval throttle.
+                    prev_focused = getattr(self, "_prev_focused_for_telemetry", None)
+                    if prev_focused is not None and prev_focused != focused:
+                        self._last_telemetry = 0.0
+                    self._prev_focused_for_telemetry = focused
+
                     movement_detected = False
                     if focused:
                         if self._focused_since is None:
@@ -1575,45 +1596,54 @@ class MonitorWorker(threading.Thread):
 
                                 cooldown = settings.potion_cooldown_ms / 1000.0
                                 if settings.hp_enabled and hp_reading is not None:
-                                    hp_current = self._current_points(
-                                        "hp", settings.max_hp, hp_reading.ratio, now
-                                    )
-                                    hp_threshold = self._threshold_for("hp", settings)
-                                    if (
-                                        self._threshold_reached(
-                                            "hp", settings, hp_current, settings.max_hp, hp_threshold
+                                    # Reject near-zero bar reads that are almost always
+                                    # capture artifacts (overlay covering the HUD, failed
+                                    # hide, or partial frame). A real 0 HP would be dead
+                                    # and potion keys would not matter; false zeros were
+                                    # burning entire potion stacks.
+                                    if hp_reading.ratio >= 0.02 and hp_reading.confidence >= 0.70:
+                                        hp_current = self._current_points(
+                                            "hp", settings.max_hp, hp_reading.ratio, now
                                         )
-                                        and now - self._last_hp_pot >= cooldown
-                                    ):
-                                        sent = self._send_game_key(
-                                            "HP potion",
-                                            settings.hp_key,
-                                            settings,
-                                            f"current {hp_current:,}/{settings.max_hp:,} · trigger {hp_threshold}",
-                                        )
-                                        self._last_hp_pot = time.monotonic()
-                                        if sent:
-                                            self._active_thresholds["hp"] = None
+                                        if hp_current > 0:
+                                            hp_threshold = self._threshold_for("hp", settings)
+                                            if (
+                                                self._threshold_reached(
+                                                    "hp", settings, hp_current, settings.max_hp, hp_threshold
+                                                )
+                                                and now - self._last_hp_pot >= cooldown
+                                            ):
+                                                sent = self._send_game_key(
+                                                    "HP potion",
+                                                    settings.hp_key,
+                                                    settings,
+                                                    f"current {hp_current:,}/{settings.max_hp:,} · trigger {hp_threshold}",
+                                                )
+                                                self._last_hp_pot = time.monotonic()
+                                                if sent:
+                                                    self._active_thresholds["hp"] = None
                                 if settings.mp_enabled and mp_reading is not None:
-                                    mp_current = self._current_points(
-                                        "mp", settings.max_mp, mp_reading.ratio, now
-                                    )
-                                    mp_threshold = self._threshold_for("mp", settings)
-                                    if (
-                                        self._threshold_reached(
-                                            "mp", settings, mp_current, settings.max_mp, mp_threshold
+                                    if mp_reading.ratio >= 0.02 and mp_reading.confidence >= 0.70:
+                                        mp_current = self._current_points(
+                                            "mp", settings.max_mp, mp_reading.ratio, now
                                         )
-                                        and now - self._last_mp_pot >= cooldown
-                                    ):
-                                        sent = self._send_game_key(
-                                            "MP potion",
-                                            settings.mp_key,
-                                            settings,
-                                            f"current {mp_current:,}/{settings.max_mp:,} · trigger {mp_threshold}",
-                                        )
-                                        self._last_mp_pot = time.monotonic()
-                                        if sent:
-                                            self._active_thresholds["mp"] = None
+                                        if mp_current > 0:
+                                            mp_threshold = self._threshold_for("mp", settings)
+                                            if (
+                                                self._threshold_reached(
+                                                    "mp", settings, mp_current, settings.max_mp, mp_threshold
+                                                )
+                                                and now - self._last_mp_pot >= cooldown
+                                            ):
+                                                sent = self._send_game_key(
+                                                    "MP potion",
+                                                    settings.mp_key,
+                                                    settings,
+                                                    f"current {mp_current:,}/{settings.max_mp:,} · trigger {mp_threshold}",
+                                                )
+                                                self._last_mp_pot = time.monotonic()
+                                                if sent:
+                                                    self._active_thresholds["mp"] = None
 
                         self._emit_telemetry(settings, focused=True, movement_detected=movement_detected)
                     else:
@@ -2123,11 +2153,13 @@ class GameOverlay:
         self.commands_label.configure(text="ENABLED COMMANDS\n" + command_text)
 
     def _start_drag(self, event) -> None:
-        if self._attached and self._focused:
+        global _OVERLAY_INTERACTING
+        if self._attached:
+            _OVERLAY_INTERACTING = True
             self._drag_start = (event.x_root, event.y_root, self._child_x, self._child_y)
 
     def _drag(self, event) -> None:
-        if not self._drag_start or not self._attached or not self._focused:
+        if not self._drag_start or not self._attached:
             return
         sx, sy, x, y = self._drag_start
         max_x = max(0, self._client_width - self._width)
@@ -2138,12 +2170,15 @@ class GameOverlay:
             self._set_native_geometry(new_x, new_y, self._width, self._height)
 
     def _end_drag(self, _event) -> None:
+        global _OVERLAY_INTERACTING
         self._drag_start = None
+        _OVERLAY_INTERACTING = False
         self._persist_geometry()
 
-
     def _start_resize(self, event) -> None:
+        global _OVERLAY_INTERACTING
         if self._attached or self._is_shown:
+            _OVERLAY_INTERACTING = True
             self._resize_start = (event.x_root, event.y_root, self._width, self._height)
 
     def _resize(self, event) -> None:
@@ -2158,7 +2193,9 @@ class GameOverlay:
             self._set_native_geometry(self._child_x, self._child_y, new_w, new_h)
 
     def _end_resize(self, _event) -> None:
+        global _OVERLAY_INTERACTING
         self._resize_start = None
+        _OVERLAY_INTERACTING = False
         self._persist_geometry()
 
     def _persist_geometry(self) -> None:
@@ -2459,8 +2496,14 @@ class MapleHelperApp:
         style.configure("TNotebook", background=self.BG, borderwidth=0)
         style.configure("TNotebook.Tab", background="#292929", foreground=self.MUTED,
                         padding=(16, 9), font=("Segoe UI Semibold", 9))
-        style.map("TNotebook.Tab", background=[("selected", self.PANEL)],
-                  foreground=[("selected", self.TEXT)])
+        # Include active + expand so tabs stay clickable under clam and do not
+        # shrink the hit area when selected (common cause of "need to spam" tabs).
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", self.PANEL), ("active", "#353535")],
+            foreground=[("selected", self.TEXT), ("active", self.TEXT)],
+            expand=[("selected", [1, 1, 1, 0])],
+        )
 
     def _build_ui(self) -> None:
         shell = ttk.Frame(self.root, padding=(18, 15, 18, 15))
@@ -2477,24 +2520,28 @@ class MapleHelperApp:
         self._shell = shell
         self.notebook = ttk.Notebook(shell)
         self.notebook.pack(fill="both", expand=True)
+        # Keyboard traversal (Ctrl+Tab) and a reliable mouse-down select so tabs
+        # still switch even when the event loop is busy with telemetry/overlay work.
+        try:
+            self.notebook.enable_traversal()
+        except Exception:
+            pass
+        self.notebook.bind("<ButtonPress-1>", self._on_notebook_press, add="+")
         self.overview_tab = ttk.Frame(self.notebook, padding=14)
         self.potions_tab = ttk.Frame(self.notebook, padding=14)
         self.movement_tab = ttk.Frame(self.notebook, padding=14)
         self.overlay_tab = ttk.Frame(self.notebook, padding=14)
         self.general_tab = ttk.Frame(self.notebook, padding=14)
-        self.activity_tab = ttk.Frame(self.notebook, padding=14)
         self.notebook.add(self.overview_tab, text="General")
         self.notebook.add(self.potions_tab, text="Auto-Pot")
         self.notebook.add(self.movement_tab, text="Auto-Cast")
         self.notebook.add(self.overlay_tab, text="Overlay")
         self.notebook.add(self.general_tab, text="Settings")
-        self.notebook.add(self.activity_tab, text="Activity")
         self._build_overview_tab()
         self._build_potions_tab()
         self._build_movement_tab()
         self._build_overlay_tab()
         self._build_general_tab()
-        self._build_activity_tab()
         self._build_ocr_warning_banner(shell)
 
     def _is_tesseract_available(self) -> bool:
@@ -2563,6 +2610,26 @@ class MapleHelperApp:
                 parent=self.root,
             )
 
+    def _on_notebook_press(self, event) -> None:
+        """Force-select the tab under the cursor on mouse-down.
+
+        ttk.Notebook occasionally drops a click when the main thread is also
+        applying telemetry / overlay updates. Selecting on ButtonPress-1 makes
+        tab switches reliable without needing to spam the tab.
+        """
+        try:
+            element = self.notebook.identify(event.x, event.y)
+            if not element or "label" not in element and "tab" not in element:
+                # identify can return '' or 'padding' outside tab labels
+                index = self.notebook.index(f"@{event.x},{event.y}")
+            else:
+                index = self.notebook.index(f"@{event.x},{event.y}")
+            if 0 <= int(index) < self.notebook.index("end"):
+                if self.notebook.index("current") != int(index):
+                    self.notebook.select(index)
+        except Exception:
+            pass
+
     def _card(self, parent, title: str) -> ttk.Frame:
         card = tk.Frame(parent, bg=self.PANEL, highlightthickness=1, highlightbackground=self.BORDER, bd=0)
         inner = ttk.Frame(card, style="Panel.TFrame", padding=14)
@@ -2614,26 +2681,57 @@ class MapleHelperApp:
 
     def _build_overview_tab(self) -> None:
         cards = ttk.Frame(self.overview_tab)
-        cards.pack(fill="x", pady=(0, 12))
-        cards.columnconfigure(0, weight=1)
-        cards.columnconfigure(1, weight=1)
+        cards.pack(fill="x", pady=(0, 8))
+        cards.columnconfigure(0, weight=1, uniform="overview_meters")
+        cards.columnconfigure(1, weight=1, uniform="overview_meters")
+        cards.rowconfigure(0, weight=1)
         self.hp_overview, self.hp_meter, self.hp_readout, self.hp_freshness = self._make_meter_card(cards, "Health", self.RED, "HP")
         self.mp_overview, self.mp_meter, self.mp_readout, self.mp_freshness = self._make_meter_card(cards, "Mana", self.MANA, "MP")
         self.hp_overview.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         self.mp_overview.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
 
-        capture = self._card(self.overview_tab, "Game window")
-        capture.pack(fill="x", pady=(0, 12))
-        self.target_info = ttk.Label(capture.inner, text="MSC Helper is Searching for MapleStory.exe. Make sure MapleStory Classic is running.",
-                                     style="Panel.TLabel", wraplength=700, justify="left")
-        self.target_info.pack(anchor="w")
+        # Game window + enabled commands side-by-side, equal width/height like HP/MP.
+        mid = ttk.Frame(self.overview_tab)
+        mid.pack(fill="x", pady=(0, 8))
+        mid.columnconfigure(0, weight=1, uniform="overview_mid")
+        mid.columnconfigure(1, weight=1, uniform="overview_mid")
+        mid.rowconfigure(0, weight=1)
 
-        commands = self._card(self.overview_tab, "Enabled Command List")
-        commands.pack(fill="both", expand=True)
-        self.enabled_summary = ttk.Label(commands.inner, text="Loading…",
-                                         style="Panel.TLabel", justify="left")
-        self.enabled_summary.pack(anchor="w")
+        capture = self._card(mid, "Game window")
+        capture.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        self.target_info = ttk.Label(
+            capture.inner,
+            text="MSC Helper is Searching for MapleStory.exe. Make sure MapleStory Classic is running.",
+            style="Panel.TLabel", wraplength=320, justify="left",
+        )
+        self.target_info.pack(anchor="nw", fill="both", expand=True)
+
+        commands = self._card(mid, "Enabled Command List")
+        commands.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        self.enabled_summary = ttk.Label(
+            commands.inner, text="Loading…", style="Panel.TLabel", justify="left", wraplength=320,
+        )
+        self.enabled_summary.pack(anchor="nw", fill="both", expand=True)
         self._update_enabled_summary()
+
+        # Activity log lives on General to remove the extra tab and empty space.
+        log_card = self._card(self.overview_tab, "Recent activity")
+        log_card.pack(fill="both", expand=True)
+        self.log = tk.Text(
+            log_card.inner, height=12, bg="#191919", fg="#dddddd",
+            insertbackground=self.TEXT, relief="flat", bd=0, wrap="word",
+            font=("Consolas", 9), padx=9, pady=8, state="disabled",
+            highlightthickness=1, highlightbackground=self.BORDER,
+        )
+        self.log.pack(fill="both", expand=True)
+        self.log.tag_configure("time", foreground="#888888")
+        self.log.tag_configure("event", foreground="#dddddd")
+        self.log.tag_configure("warning", foreground=self.AMBER)
+        self.log.tag_configure("success", foreground=self.GREEN)
+        ttk.Label(
+            self.overview_tab, text="No key values or typed text are recorded.",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(4, 0))
 
     def _build_potions_tab(self) -> None:
         ttk.Label(self.potions_tab, text="Auto-pot for mp and hp.",
@@ -3038,18 +3136,8 @@ class MapleHelperApp:
             messagebox.showerror("Open folder", f"Could not open:\n{CONFIG_DIR}\n\n{exc}", parent=self.root)
 
     def _build_activity_tab(self) -> None:
-        log_card = self._card(self.activity_tab, "Recent activity")
-        log_card.pack(fill="both", expand=True)
-        self.log = tk.Text(log_card.inner, height=20, bg="#191919", fg="#dddddd", insertbackground=self.TEXT,
-                           relief="flat", bd=0, wrap="word", font=("Consolas", 9), padx=9, pady=8,
-                           state="disabled", highlightthickness=1, highlightbackground=self.BORDER)
-        self.log.pack(fill="both", expand=True)
-        self.log.tag_configure("time", foreground="#888888")
-        self.log.tag_configure("event", foreground="#dddddd")
-        self.log.tag_configure("warning", foreground=self.AMBER)
-        self.log.tag_configure("success", foreground=self.GREEN)
-        ttk.Label(self.activity_tab, text="No key values or typed text are recorded.",
-                  style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
+        # Activity log was moved into the General tab in 0.2.1.
+        pass
 
     def _on_feature_toggle(self) -> None:
         if not self.apply_settings(show_errors=False):
@@ -3627,10 +3715,16 @@ class MapleHelperApp:
                 color = self.AMBER
             self._set_status(text, color)
 
-        # At most a few log lines per tick so the Text widget cannot stall input.
+        # Keep the hot path light so notebook tab clicks are not starved.
+        # Log lines and overlay geometry are deferred to idle time.
         if log_batch:
-            for data, tag in log_batch[-4:]:
-                self._log(data, tag)
+            pending_logs = log_batch[-4:]
+
+            def _flush_logs(batch=pending_logs) -> None:
+                for data, tag in batch:
+                    self._log(data, tag)
+
+            self.root.after_idle(_flush_logs)
 
         # Telemetry is pure widget updates (already gated by change-detection).
         if latest_telemetry is not None:
@@ -3644,7 +3738,8 @@ class MapleHelperApp:
         if latest_target is not None:
             self._handle_target_window(latest_target)
 
-        self.root.after(80, self._process_events)
+        # 100 ms is still responsive for status; slightly less contention than 80.
+        self.root.after(100, self._process_events)
 
     def _handle_target_window(self, data: dict[str, Any]) -> None:
         title = data.get("title") or "MapleStory"
@@ -3899,8 +3994,8 @@ class MapleHelperApp:
                         pass
         except Exception:
             pass
-        # Poll rarely when the overlay is off so the main window stays snappy.
-        self.root.after(1000 if enabled else 2500, self._refresh_overlay)
+        # Poll often enough that focus status on the overlay feels instantaneous.
+        self.root.after(200 if enabled else 2500, self._refresh_overlay)
 
     def _set_status(self, text: str, color: str) -> None:
         label = f"●  {text.upper()}"

@@ -1,9 +1,23 @@
 # MSC Helper
 
 **Release:** `0.2.0`  
-**MapleStory Classic Helper** — an input automation tool for MapleStory Classic.
+**MapleStory Classic Helper** — configurable input automation macro for MapleStory Classic
 
-MSC Helper offers automatic potion use and ordered ability casting with a live in-game overlay.
+## Features
+
+- Auto-potting - automatically using hp and mp pots when necessary.
+- Auto-casting - automatically casting any abilities that you want to cast when it's off cooldown such as Nimble Feet and Recovery. Works with the pick-up keybind but isn't recommended.
+- Game overlay to see toggled commands, HUD monitoring, etc. (Can be toggled off)
+- Settings for commands and general settings for maximum configurability.
+- Monitors the in-game HUD to track your current and max Mana and Health.
+- Offers auto-uptades and logging.
+
+## Requirements
+
+- Windows 10/11
+- Python 3.10+ (for source runs)
+- Tesseract OCR (recommended, for best accuracy)
+- Dependencies in `requirements.txt` plus [native-inputs](https://github.com/zgndia/native-inputs) (for running from source)
 
 ## Installation
 
@@ -20,34 +34,12 @@ MSC Helper offers automatic potion use and ordered ability casting with a live i
 
 Administrator elevation is required for reliable input delivery.
 
-## Features
-
-- Detects HP and MP HUD bars via template matching; estimates fill when OCR is unavailable.
-- Optional Tesseract OCR for exact `current/max` values (preferred when available).
-- Auto-detects maximum HP/MP from the HUD.
-- Locates visible top-level windows owned by `MapleStory.exe` without requiring an exact title match.
-- Passive desktop capture; does not steal focus.
-- Cached HUD region after first successful scan for lower CPU use.
-- Auto-pot with threshold (missing points or remaining %) plus random offset.
-- Configurable minimum focus-hold before any input; optional passive background HUD reading (off by default).
-- Auto-Casting: presses ability keys in sequence, with separate delays between keys and after a full set.
-- Live status overlay (resizable).
-- Automatic update checks (can be disabled under Settings).
-- Activity log in the UI and file logs under `%APPDATA%\MSCHelper\logs\` (`latest.log` + dated rotating logs).
-
-## Requirements
-
-- Windows 10/11
-- Python 3.10+ (for source runs)
-- Tesseract OCR (recommended, for best accuracy)
-- Dependencies in `requirements.txt` plus `native-keyboard-inputs` 0.3.0+
+## Running (from source)
 
 ```cmd
 python -m pip install -r requirements.txt
-python -m pip install native-keyboard-inputs
+python -m pip install native-inputs
 ```
-
-## Running (from source)
 
 ```cmd
 python autopot.py
@@ -76,11 +68,6 @@ Settings, the last HP/MP snapshot, logs, and update marks are stored under:
 Use **Settings → Go to file location** inside the app, or open that folder manually.
 
 Most options ship with safe defaults. Prefer leaving cooldown, scan interval, and key-hold values at their recommended defaults unless you have a specific reason to change them.
-
-### Auto-cast delays
-
-- **Delay between each cast** — pause between individual keys in the ability list (e.g. after Q before E).
-- **Delay after ability set** — longer pause after the full list has been pressed once before the cycle restarts.
 
 ### Updates
 

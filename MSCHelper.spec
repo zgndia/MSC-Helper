@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('assets', 'assets')]
+datas = [('assets', 'assets'), ('VERSION', '.'), ('icon.ico', '.')]
 binaries = []
 hiddenimports = ['mss', 'cv2', 'numpy']
 tmp_ret = collect_all('mss')

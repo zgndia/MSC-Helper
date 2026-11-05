@@ -26,6 +26,8 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed --uac-admin ^
     --icon "icon.ico" ^
     --optimize 2 ^
     --add-data "assets;assets" ^
+    --add-data "VERSION;." ^
+    --add-data "icon.ico;." ^
     --collect-all mss ^
     --collect-all native_keyboard_inputs ^
     --collect-all pytesseract ^

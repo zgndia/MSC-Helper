@@ -3,6 +3,8 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes
 import json
+import logging
+import logging.handlers
 import os
 import ntpath
 import queue
@@ -13,6 +15,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -60,10 +64,57 @@ else:
     DETECTOR_IMPORT_ERROR = None
 
 APP_NAME = "MSC Helper"
+APP_VERSION = "0.2.0"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "MSCHelper"
 CONFIG_PATH = CONFIG_DIR / "settings.json"
 CAPTURE_PATH = CONFIG_DIR / "last_capture.json"
+LOGS_DIR = CONFIG_DIR / "logs"
+VERSION_MARK_PATH = CONFIG_DIR / "VERSION"
+GITHUB_VERSION_URL = "https://raw.githubusercontent.com/zgndia/MSC-Helper/main/VERSION"
+GITHUB_RELEASES_API = "https://api.github.com/repos/zgndia/MSC-Helper/releases/latest"
+GITHUB_REPO = "zgndia/MSC-Helper"
+
+_file_logger: logging.Logger | None = None
+
+
+def setup_file_logging() -> logging.Logger:
+    """Configure rotating file logs under %APPDATA%/MSCHelper/logs."""
+    global _file_logger
+    if _file_logger is not None:
+        return _file_logger
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("msc_helper")
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    # Dated rotating log.
+    log_path = LOGS_DIR / f"msc_helper_{datetime.now().strftime('%Y%m%d')}.log"
+    dated = logging.handlers.RotatingFileHandler(
+        log_path, maxBytes=2_000_000, backupCount=5, encoding="utf-8"
+    )
+    dated.setFormatter(fmt)
+    logger.addHandler(dated)
+    # Always-on latest.log (truncated each run, single active session file).
+    latest_path = LOGS_DIR / "latest.log"
+    try:
+        # Truncate so each session starts clean.
+        latest_path.write_text("", encoding="utf-8")
+    except OSError:
+        pass
+    latest = logging.FileHandler(latest_path, mode="a", encoding="utf-8")
+    latest.setFormatter(fmt)
+    logger.addHandler(latest)
+    logger.propagate = False
+    _file_logger = logger
+    logger.info("MSC Helper %s started", APP_VERSION)
+    return logger
+
+
+def get_logger() -> logging.Logger:
+    return _file_logger or setup_file_logging()
 
 
 @dataclass(frozen=True)
@@ -92,11 +143,17 @@ class Settings:
     # When True, Tesseract OCR is used for exact current/max readings and max-stat detection.
     auto_detect_max_stats: bool = True
     hud_monitoring_enabled: bool = True
+    # When True, sample HP/MP while MapleStory is visible but not focused.
+    # Off by default — background reads can under-report fill and force potions on focus.
+    passive_hud_reading: bool = False
+    # Require the game to stay focused this long before any key is injected.
+    min_focus_hold_ms: int = 1000
     ocr_interval_ms: int = 1800
     ability_spam_enabled: bool = False
     ability_keys: str = "q, e, r"
     movement_keys: str = "w, a, s, d"
-    ability_interval_ms: int = 50
+    ability_interval_ms: int = 250
+    ability_set_delay_ms: int = 800
     movement_hold_ms: int = 1250
     pause_spam_while_typing: bool = True
     overlay_enabled: bool = True
@@ -104,6 +161,7 @@ class Settings:
     overlay_y_offset: int = 42
     overlay_width: int = 390
     overlay_height: int = 315
+    auto_update_enabled: bool = True
     last_window_title: str = ""
     last_window_pid: int = 0
     last_window_hwnd: int = 0
@@ -149,6 +207,138 @@ def get_window_rect(hwnd: int) -> tuple[int, int, int, int] | None:
         return None
 
 
+def _list_helper_overlay_hwnds() -> list[int]:
+    """Visible top-level windows owned by this process (the live status overlay).
+
+    The overlay is WS_EX_NOACTIVATE and owned by the game, so desktop capture of
+    the game client includes its pixels whenever it covers the HUD. Callers hide
+    these briefly around an mss grab so HP/MP template matching sees the real bars.
+    """
+    if sys.platform != "win32" or _USER32 is None:
+        return []
+    found: list[int] = []
+    enum_windows = _USER32.EnumWindows
+    enum_windows.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+    enum_windows.restype = ctypes.c_int
+    is_visible = _USER32.IsWindowVisible
+    is_visible.argtypes = (ctypes.c_void_p,)
+    is_visible.restype = ctypes.c_int
+    callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def visit(hwnd, _lparam):
+        if not is_visible(hwnd):
+            return True
+        pid = ctypes.c_ulong()
+        _USER32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if int(pid.value) != OUR_PID:
+            return True
+        # Prefer toolwindow / noactivate overlays; skip the main Tk frame if possible
+        # by requiring an empty or short caption (overrideredirect overlays).
+        length = _USER32.GetWindowTextLengthW(hwnd)
+        if length > 0:
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            _USER32.GetWindowTextW(hwnd, buffer, len(buffer))
+            title = buffer.value or ""
+            # Main app title contains "MSC Helper"; the overlay is captionless.
+            if is_helper_title(title):
+                return True
+        found.append(int(hwnd))
+        return True
+
+    enum_windows(callback_type(visit), 0)
+    return found
+
+
+def _hide_helper_overlays() -> list[int]:
+    """Hide our overlay windows for a clean desktop capture. Returns hwnds to restore."""
+    if sys.platform != "win32" or _USER32 is None:
+        return []
+    hidden: list[int] = []
+    try:
+        show = _USER32.ShowWindow
+        show.argtypes = (ctypes.c_void_p, ctypes.c_int)
+        show.restype = ctypes.c_int
+        for hwnd in _list_helper_overlay_hwnds():
+            # SW_HIDE = 0
+            show(ctypes.c_void_p(hwnd), 0)
+            hidden.append(hwnd)
+    except Exception:
+        pass
+    return hidden
+
+
+def _restore_helper_overlays(hwnds: list[int]) -> None:
+    """Show overlay windows again without activating them (SW_SHOWNOACTIVATE = 4)."""
+    if sys.platform != "win32" or _USER32 is None or not hwnds:
+        return
+    try:
+        show = _USER32.ShowWindow
+        show.argtypes = (ctypes.c_void_p, ctypes.c_int)
+        show.restype = ctypes.c_int
+        for hwnd in hwnds:
+            show(ctypes.c_void_p(hwnd), 4)
+    except Exception:
+        pass
+
+
+def is_helper_under_cursor() -> bool:
+    """True when the mouse is over any window belonging to this process.
+
+    The live overlay is WS_EX_NOACTIVATE and owned by MapleStory, so clicking or
+    resting on it does not change the OS foreground window — the game stays
+    "focused" and monitoring would keep capturing. Treating helper-under-cursor
+    as not game-focused stops HP/MP tracking while the user is on the overlay
+    or the main GUI.
+    """
+    if sys.platform != "win32" or _USER32 is None:
+        return False
+    try:
+        _USER32.GetCursorPos.argtypes = (ctypes.POINTER(ctypes.wintypes.POINT),)
+        _USER32.GetCursorPos.restype = ctypes.c_int
+        _USER32.WindowFromPoint.argtypes = (ctypes.wintypes.POINT,)
+        _USER32.WindowFromPoint.restype = ctypes.c_void_p
+        point = ctypes.wintypes.POINT()
+        if not _USER32.GetCursorPos(ctypes.byref(point)):
+            return False
+        hwnd = _USER32.WindowFromPoint(point)
+        if not hwnd:
+            return False
+        # Walk up the parent chain; WindowFromPoint can hit a child control.
+        get_parent = _USER32.GetParent
+        get_parent.argtypes = (ctypes.c_void_p,)
+        get_parent.restype = ctypes.c_void_p
+        current = int(hwnd)
+        for _ in range(8):
+            if not current:
+                break
+            pid = ctypes.c_ulong()
+            _USER32.GetWindowThreadProcessId(ctypes.c_void_p(current), ctypes.byref(pid))
+            if int(pid.value) == OUR_PID:
+                return True
+            parent = get_parent(ctypes.c_void_p(current))
+            if not parent or int(parent) == current:
+                # Also check owner (GWLP_HWNDPARENT) for owned popups.
+                break
+            current = int(parent)
+        # Owned overlay: parent walk may stop; check root owner via GetAncestor.
+        try:
+            get_ancestor = _USER32.GetAncestor
+            get_ancestor.argtypes = (ctypes.c_void_p, ctypes.c_uint)
+            get_ancestor.restype = ctypes.c_void_p
+            GA_ROOT = 2
+            root = get_ancestor(hwnd, GA_ROOT)
+            if root:
+                pid = ctypes.c_ulong()
+                _USER32.GetWindowThreadProcessId(ctypes.c_void_p(int(root)), ctypes.byref(pid))
+                if int(pid.value) == OUR_PID:
+                    return True
+        except Exception:
+            pass
+        return False
+    except Exception:
+        return False
+
+
 def get_client_rect_screen(hwnd: int) -> tuple[int, int, int, int] | None:
     """Return the target window's client rectangle in desktop coordinates."""
     if sys.platform != "win32" or _USER32 is None or not hwnd:
@@ -177,10 +367,55 @@ def is_window_minimized(hwnd: int) -> bool:
         return False
 
 
-TARGET_EXECUTABLES = {"maplestory.exe"}
+TARGET_EXECUTABLES = {
+    "maplestory.exe",
+    "maplestory_classic.exe",  # MapleStory Classic client
+}
+# Never treat our own process (or typical helper hosts) as the game target.
+OUR_PID = os.getpid()
+HELPER_EXECUTABLES = {
+    "mschelper.exe",
+    "python.exe",
+    "pythonw.exe",
+    "py.exe",
+}
+# Titles that must never be treated as the game (case-insensitive substring).
+HELPER_TITLE_MARKERS = (
+    "msc helper",
+    "mschelper",
+)
+
 # Process image paths are immutable for the lifetime of a PID. Cache them briefly
 # so foreground checks do not repeatedly open/query the same process.
 _PROCESS_EXE_CACHE: dict[int, tuple[float, str]] = {}
+
+
+def is_helper_title(title: str) -> bool:
+    """True when the window caption belongs to this helper, not MapleStory."""
+    if not title:
+        return False
+    lowered = title.casefold()
+    return any(marker in lowered for marker in HELPER_TITLE_MARKERS)
+
+
+def is_helper_process(process_id: int) -> bool:
+    """True for this app's PID or any known helper-host executable."""
+    if not process_id:
+        return False
+    if int(process_id) == OUR_PID:
+        return True
+    executable = ntpath.basename(get_process_executable(int(process_id))).casefold()
+    return bool(executable) and executable in HELPER_EXECUTABLES
+
+
+def is_maplestory_process(process_id: int) -> bool:
+    """True only when the process image is a MapleStory client and not this helper."""
+    if not process_id or is_helper_process(process_id):
+        return False
+    executable = ntpath.basename(get_process_executable(int(process_id))).casefold()
+    if not executable or executable in HELPER_EXECUTABLES:
+        return False
+    return executable in TARGET_EXECUTABLES
 
 
 VK_MOVEMENT_KEYS = (0x57, 0x41, 0x53, 0x44, 0x20)  # W / A / S / D / Space
@@ -279,11 +514,15 @@ def find_target_windows(window_title_fragment: str) -> list[tuple[int, str, int]
         buffer = ctypes.create_unicode_buffer(max(1, length + 1))
         _USER32.GetWindowTextW(hwnd, buffer, len(buffer))
         title = buffer.value
+        if is_helper_title(title):
+            return True
         pid = ctypes.c_ulong()
         _USER32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        executable = ntpath.basename(get_process_executable(int(pid.value))).casefold()
-        if executable in TARGET_EXECUTABLES:
-            matches.append((int(hwnd), title, int(pid.value)))
+        pid_int = int(pid.value)
+        if is_helper_process(pid_int):
+            return True
+        if is_maplestory_process(pid_int):
+            matches.append((int(hwnd), title, pid_int))
         return True
 
     callback = callback_type(visit)
@@ -295,21 +534,28 @@ def find_target_windows(window_title_fragment: str) -> list[tuple[int, str, int]
 
 
 # Short-lived cache for focus checks so the hot loop does not re-open the
-# process handle on every 80–250 ms tick.
+# process handle on every 80–250 ms tick. Keep TTL short so a helper↔game
+# focus switch is noticed quickly; input paths always invalidate + re-query.
 _FOCUS_CACHE: tuple[float, bool, str] = (0.0, False, "")
-_FOCUS_CACHE_TTL = 0.08  # seconds
+_FOCUS_CACHE_TTL = 0.05  # seconds
 
 
 def is_target_focused(window_title_fragment: str, window_id: int = 0) -> tuple[bool, str]:
-    """Accept input only when the foreground HWND belongs to MapleStory.exe.
+    """Accept input only when the foreground HWND belongs to a MapleStory client.
 
     window_id is retained for settings-file compatibility but ignored because
-    process IDs and window handles change between launches.
+    process IDs and window handles change between launches. MSC Helper's own
+    windows (by PID, executable, or title) are never treated as the game target.
     """
     global _FOCUS_CACHE
     now = time.monotonic()
     cached_at, cached_ok, cached_title = _FOCUS_CACHE
     if now - cached_at < _FOCUS_CACHE_TTL:
+        # Even a fresh cache entry can be wrong across a fast helper↔game
+        # focus switch. Reject known helper titles without waiting for TTL.
+        if cached_ok and is_helper_title(cached_title):
+            _FOCUS_CACHE = (now, False, cached_title)
+            return False, cached_title
         return cached_ok, cached_title
 
     title, foreground_pid, hwnd = get_foreground_window_info()
@@ -319,12 +565,30 @@ def is_target_focused(window_title_fragment: str, window_id: int = 0) -> tuple[b
     if sys.platform != "win32":
         _FOCUS_CACHE = (now, False, title)
         return False, title
-    # The process image is the identity check; window captions can vary by
-    # server/build and are not reliable enough to gate capture or input.
-    executable = ntpath.basename(get_process_executable(foreground_pid)).casefold()
-    ok = executable in TARGET_EXECUTABLES
+    # Process image is the primary identity check. Also reject this helper by
+    # title / under-cursor so the NOACTIVATE overlay cannot leave the game
+    # "focused" while the user is on MSC Helper UI.
+    if (
+        is_helper_title(title)
+        or is_helper_process(foreground_pid)
+        or is_helper_under_cursor()
+    ):
+        ok = False
+    else:
+        ok = is_maplestory_process(foreground_pid)
     _FOCUS_CACHE = (now, ok, title)
     return ok, title
+
+
+def invalidate_focus_cache() -> None:
+    global _FOCUS_CACHE
+    _FOCUS_CACHE = (0.0, False, "")
+
+
+def seed_focus_cache(ok: bool, title: str = "") -> None:
+    """Force the focus cache to a known state (used after a fresh foreground query)."""
+    global _FOCUS_CACHE
+    _FOCUS_CACHE = (time.monotonic(), bool(ok), title or "")
 
 
 MOVEMENT_VK_NAMES = {
@@ -486,6 +750,7 @@ class MonitorWorker(threading.Thread):
         self._last_hp_pot = 0.0
         self._last_mp_pot = 0.0
         self._next_ability_at = 0.0
+        self._ability_cycle_idx = 0
         self._last_ocr = 0.0
         self._movement_gate = MovementGate()
         self._typing_lock = threading.Lock()
@@ -520,6 +785,10 @@ class MonitorWorker(threading.Thread):
         self._ocr_lock = threading.Lock()
         self._ocr_busy = False
         self._ocr_thread: threading.Thread | None = None
+        # Potion keys are blocked until at least one focused HUD scan completes.
+        self._hud_scan_ready = False
+        # Monotonic timestamp when the target window most recently became focused.
+        self._focused_since: float | None = None
 
     def emit_status(self, text: str) -> None:
         if text != self._last_status:
@@ -528,23 +797,69 @@ class MonitorWorker(threading.Thread):
 
     def emit_log(self, text: str) -> None:
         self.events.put(("log", text))
+        try:
+            get_logger().info(text)
+        except Exception:
+            pass
 
     def _send_game_key(self, kind: str, key: str, settings: Settings, detail: str = "") -> bool:
-        # Re-check the title and configured HWND/PID immediately before every injection.
+        # Always re-check focus immediately before any injection decision.
         focused, _title = is_target_focused(settings.window_title, settings.window_id)
         if not focused:
+            self._focused_since = None
             self.emit_log(
-                f"Skipped {kind} key {key.upper()}: target window/process ID "
-                f"{settings.window_title!r}/{settings.window_id} is not foreground."
+                f"Skipped {kind} key {key.upper()}: target window is not in focus."
             )
             return False
+
+        hold_ms = max(0, int(getattr(settings, "min_focus_hold_ms", 1000) or 0))
+        now = time.monotonic()
+        if self._focused_since is None:
+            self._focused_since = now
+        focused_for_ms = (now - self._focused_since) * 1000.0
+        if focused_for_ms < hold_ms:
+            self.emit_log(
+                f"Skipped {kind} key {key.upper()}: game focused for only "
+                f"{focused_for_ms:.0f} ms (need {hold_ms} ms)."
+            )
+            return False
+
         if kind == "random spam":
             if not settings.ability_spam_enabled or not is_movement_key_held(settings.movement_keys):
                 return False
             if settings.pause_spam_while_typing and self._typing_was_recent():
                 return False
+        else:
+            # Potion / non-cast keys require at least one completed focused HUD scan
+            # so we never inject before monitoring has observed the game state.
+            if not self._hud_scan_ready:
+                self.emit_log(
+                    f"Skipped {kind} key {key.upper()}: waiting for the first HUD monitor scan."
+                )
+                return False
         if inputs is None:
             self.emit_log("Input unavailable: native-keyboard-inputs is not installed in this Python environment.")
+            return False
+        # Final focus check right before SendInput — covers tabbing out after the
+        # decision path above but before the key is actually delivered. Also
+        # rejects the helper by title so a GUI focus immediately before the game
+        # is focused cannot slip through.
+        invalidate_focus_cache()
+        focused_now, _ = is_target_focused(settings.window_title, settings.window_id)
+        title_now, pid_now, hwnd_now = get_foreground_window_info()
+        if (
+            not focused_now
+            or not hwnd_now
+            or not pid_now
+            or is_helper_title(title_now)
+            or is_helper_process(pid_now)
+            or not is_maplestory_process(pid_now)
+            or is_helper_under_cursor()
+        ):
+            self._focused_since = None
+            self.emit_log(
+                f"Skipped {kind} key {key.upper()}: target window lost focus right before send."
+            )
             return False
         # The configured value is a base hold duration. Vary each tap so key-down
         # and key-up timing is not identical on every event. Native tap() accepts
@@ -604,7 +919,7 @@ class MonitorWorker(threading.Thread):
         if settings.mp_enabled:
             enabled_commands.append(f"MP potion ({settings.mp_key.upper()})")
         if settings.ability_spam_enabled:
-            enabled_commands.append(f"Random key spam ({settings.ability_keys.upper()})")
+            enabled_commands.append(f"Auto-cast ({settings.ability_keys.upper()})")
         payload: dict[str, Any] = {
             "focused": focused, "max_hp": settings.max_hp, "max_mp": settings.max_mp,
             "movement_detected": bool(movement_detected),
@@ -767,6 +1082,34 @@ class MonitorWorker(threading.Thread):
                 "height": client_height,
             }
 
+        # The live overlay is a desktop window owned by MapleStory and often sits
+        # on top of the HP/MP HUD. mss captures whatever is composited on screen,
+        # so without hiding the overlay first the detector sees overlay pixels,
+        # reports partial/zero bars, and flips between HP and MP. Only hide when
+        # an overlay actually intersects the capture region to limit flicker.
+        cap_left = int(capture_region["left"])
+        cap_top = int(capture_region["top"])
+        cap_right = cap_left + int(capture_region["width"])
+        cap_bottom = cap_top + int(capture_region["height"])
+        overlays_to_hide: list[int] = []
+        for oh in _list_helper_overlay_hwnds():
+            orect = get_window_rect(oh)
+            if orect is None:
+                continue
+            ol, ot, oright, ob = orect
+            if ol < cap_right and oright > cap_left and ot < cap_bottom and ob > cap_top:
+                overlays_to_hide.append(oh)
+        hidden_overlays: list[int] = []
+        if overlays_to_hide and sys.platform == "win32" and _USER32 is not None:
+            try:
+                show = _USER32.ShowWindow
+                show.argtypes = (ctypes.c_void_p, ctypes.c_int)
+                show.restype = ctypes.c_int
+                for oh in overlays_to_hide:
+                    show(ctypes.c_void_p(oh), 0)  # SW_HIDE
+                    hidden_overlays.append(oh)
+            except Exception:
+                hidden_overlays = []
         try:
             # mss returns BGRA; take a view of the first 3 channels to avoid an extra copy.
             bgra = np.asarray(screen.grab(capture_region))
@@ -774,6 +1117,8 @@ class MonitorWorker(threading.Thread):
         except Exception as exc:
             self.emit_log(f"Screen capture failed: {type(exc).__name__}: {exc}")
             return None, rect, use_roi
+        finally:
+            _restore_helper_overlays(hidden_overlays)
         return frame, rect, use_roi
 
     def _remember_hud_roi(self, readings: dict[str, BarReading | None], frame_shape: tuple[int, ...], was_roi: bool) -> None:
@@ -823,9 +1168,15 @@ class MonitorWorker(threading.Thread):
 
         # OCR is intentionally asynchronous. Tesseract can take 500ms+ and must
         # never block the monitoring loop (that was the main remaining freeze).
-        ocr_due = settings.auto_detect_max_stats and self.detector.ocr_available and (
-            self.force_ocr_event.is_set()
-            or now - self._last_ocr >= settings.ocr_interval_ms / 1000.0
+        # OCR only runs when HUD monitoring is on; the Tesseract toggle alone is not enough.
+        ocr_due = (
+            settings.hud_monitoring_enabled
+            and settings.auto_detect_max_stats
+            and self.detector.ocr_available
+            and (
+                self.force_ocr_event.is_set()
+                or now - self._last_ocr >= settings.ocr_interval_ms / 1000.0
+            )
         )
         if ocr_due and hp_reading is not None and mp_reading is not None:
             self._schedule_ocr(frame, hp_reading, mp_reading, settings)
@@ -926,32 +1277,42 @@ class MonitorWorker(threading.Thread):
             }))
 
         found_both = hp_reading is not None and mp_reading is not None
-        if found_both:
-            self.emit_status("Captured MapleStory HUD · HP and MP found")
-        elif hp_reading is None and mp_reading is None:
-            self.emit_status("Game found · waiting for visible HP and MP HUD")
+        # Passive/background captures must not use the live "partially detected"
+        # wording — that status is reserved for focused monitoring and was the
+        # confusing message users saw after tabbing to MSC Helper.
+        if focused:
+            if found_both:
+                self.emit_status("Captured MapleStory HUD · HP and MP found")
+            elif hp_reading is None and mp_reading is None:
+                self.emit_status("Game found · waiting for visible HP and MP HUD")
+            else:
+                missing = "MP" if mp_reading is None else "HP"
+                self.emit_status(f"HUD partially detected · {missing} not found")
         else:
-            missing = "MP" if mp_reading is None else "HP"
-            self.emit_status(f"HUD partially detected · {missing} not found")
+            if found_both:
+                self.emit_status(
+                    "MapleStory Classic is in the background · passive HUD sample OK"
+                )
+            else:
+                self.emit_status(
+                    "MapleStory Classic is in the background · passive capture active when visible"
+                )
         self._emit_telemetry(settings, focused=focused, movement_detected=False)
         return found_both
 
     def _initial_target_capture(self, screen, settings: Settings) -> None:
-        """Find MapleStory and try a passive desktop capture without changing focus."""
+        """Find MapleStory and optionally try a passive desktop capture without changing focus."""
         matches = find_target_windows(settings.window_title)
         if not matches:
             self.emit_status("Waiting for MapleStory.exe · no matching window found")
             self.emit_log("No visible MapleStory window was found at startup. Discovery will continue in the background.")
             return
 
-        self.emit_log("MapleStory window found. Trying passive screen capture; game focus will not be changed.")
-        for hwnd, title, pid in matches:
-            if self.stop_event.is_set():
-                return
-            if self._capture_target_frame(screen, settings, hwnd, title, pid):
-                self.emit_log("HP and MP captured passively without activating MapleStory.")
-                return
-        self.emit_log("The MapleStory window was found, but the visible HUD could not be read. No focus changes or activation attempts were made; background detection will retry.")
+        # Never sample the HUD until MapleStory is the focused foreground window.
+        self.emit_log(
+            "MapleStory window found. Waiting for game focus before sampling HP/MP "
+            "(no background capture)."
+        )
 
     def _discover_background_target(self, settings: Settings) -> tuple[int, str, int] | None:
         """Discover the target window and report visibility without changing focus."""
@@ -1071,11 +1432,31 @@ class MonitorWorker(threading.Thread):
                     started = time.monotonic()
                     settings: Settings = self.settings_getter()
                     self._active_ocr_interval = settings.ocr_interval_ms
-                    focused, _window_title = is_target_focused(settings.window_title, settings.window_id)
+                    # Always decide focus from a fresh foreground query — never
+                    # trust the short-lived cache alone for capture/input.
+                    # The overlay is owned by MapleStory and WS_EX_NOACTIVATE, so
+                    # the game can remain the OS foreground while the user is on
+                    # the overlay. is_helper_under_cursor() treats that as unfocused
+                    # so we never capture or inject unless the game is truly active.
+                    title, pid, hwnd = get_foreground_window_info()
+                    focused = bool(
+                        hwnd
+                        and pid
+                        and not is_helper_title(title)
+                        and not is_helper_process(pid)
+                        and is_maplestory_process(pid)
+                        and not is_helper_under_cursor()
+                    )
+                    seed_focus_cache(focused, title or "")
+
                     movement_detected = False
+                    if focused:
+                        if self._focused_since is None:
+                            self._focused_since = time.monotonic()
+                    else:
+                        self._focused_since = None
 
                     if focused:
-                        title, pid, hwnd = get_foreground_window_info()
                         # Re-query geometry only when the HWND changes or a few
                         # seconds have passed; continuous GetClientRect/ClientToScreen
                         # is unnecessary and contributes to desktop contention.
@@ -1126,29 +1507,47 @@ class MonitorWorker(threading.Thread):
                         )
                         if typing_recent and not self._typing_pause_active:
                             self._typing_pause_active = True
-                            self.emit_log("Ability spam paused: typing detected. A fresh movement hold is required to resume.")
+                            self.emit_log("Auto-cast paused: typing detected. A fresh movement hold is required to resume.")
                         elif not typing_recent and self._typing_pause_active:
                             self._typing_pause_active = False
-                            self.emit_log("Typing pause cleared. Hold a configured listener key again to re-arm spam.")
+                            self.emit_log("Typing pause cleared. Hold a configured listener key again to re-arm auto-cast.")
                         if armed_now:
-                            self.emit_log(f"Random key spam armed after {settings.movement_hold_ms} ms of continuous configured-key hold.")
+                            self.emit_log(f"Auto-cast armed after {settings.movement_hold_ms} ms of continuous configured-key hold.")
                             self._next_ability_at = 0.0
+                            self._ability_cycle_idx = 0
                         if disarmed_now and not typing_recent:
-                            self.emit_log("Ability spam paused because listener keys were released or focus changed.")
+                            self.emit_log("Auto-cast paused because listener keys were released or focus changed.")
                         if settings.ability_spam_enabled and self._movement_gate.armed and not typing_recent:
                             now = time.monotonic()
                             if now >= self._next_ability_at:
-                                ability_key = random.choice(parse_key_list(settings.ability_keys))
-                                if not self.stop_event.is_set() and self._send_game_key("random spam", ability_key, settings):
-                                    base_interval = settings.ability_interval_ms / 1000.0
-                                    self._next_ability_at = time.monotonic() + base_interval * random.uniform(0.75, 1.35)
+                                keys = parse_key_list(settings.ability_keys)
+                                if not keys:
+                                    self._next_ability_at = time.monotonic() + 0.25
                                 else:
-                                    self._next_ability_at = time.monotonic() + 0.10
+                                    # Cycle sequentially through the ability set.
+                                    idx = getattr(self, "_ability_cycle_idx", 0) % len(keys)
+                                    ability_key = keys[idx]
+                                    if not self.stop_event.is_set() and self._send_game_key("random spam", ability_key, settings):
+                                        next_idx = idx + 1
+                                        self._ability_cycle_idx = next_idx
+                                        if next_idx >= len(keys):
+                                            # Finished a full set — apply set delay before restarting.
+                                            self._ability_cycle_idx = 0
+                                            delay = settings.ability_set_delay_ms / 1000.0
+                                            delay *= random.uniform(0.85, 1.15)
+                                        else:
+                                            delay = settings.ability_interval_ms / 1000.0
+                                            delay *= random.uniform(0.80, 1.20)
+                                        self._next_ability_at = time.monotonic() + max(0.03, delay)
+                                    else:
+                                        self._next_ability_at = time.monotonic() + 0.10
 
                         # --- Expensive path: screen capture only when HUD monitoring is on ---
                         # When hud_monitoring_enabled is False, zero screen grabs occur.
                         capture_interval = max(0.20, settings.hud_scan_interval_ms / 1000.0)
-                        need_hud = settings.hp_enabled or settings.mp_enabled or settings.auto_detect_max_stats
+                        need_hud = settings.hp_enabled or settings.mp_enabled or (
+                            settings.auto_detect_max_stats and settings.hud_monitoring_enabled
+                        )
                         if (
                             settings.hud_monitoring_enabled
                             and need_hud
@@ -1156,6 +1555,10 @@ class MonitorWorker(threading.Thread):
                         ):
                             self._last_capture_mono = now
                             screenshot, capture_rect, was_roi = self._grab_target_frame(screen, hwnd)
+                            # First completed focused HUD interval unlocks potion keys.
+                            if not self._hud_scan_ready:
+                                self._hud_scan_ready = True
+                                self.emit_log("HUD monitor completed its first scan; potion keys are now allowed.")
                             if screenshot is not None and capture_rect is not None:
                                 hp_reading, mp_reading, now = self._read_captured_frame(
                                     screenshot, settings, was_roi
@@ -1215,24 +1618,29 @@ class MonitorWorker(threading.Thread):
                         self._emit_telemetry(settings, focused=True, movement_detected=movement_detected)
                     else:
                         self._fresh_flags = {"hp": False, "mp": False}
+                        # Always drop live readings when the game is not focused.
+                        # Stale / partial / zero samples from the moment of tab-out
+                        # were showing as "HUD partially detected" and flipping
+                        # HP/MP to 0 while MSC Helper was in the foreground.
+                        # Passive mode may re-sample below; until then show nothing.
+                        self._last_reading = {"hp": None, "mp": None}
+                        self._last_display = {"hp": None, "mp": None}
+                        self._hud_scan_ready = False
+                        # Never capture the game client while it is unfocused —
+                        # including passive_hud_reading. Users expect zero HP/MP
+                        # scans when MapleStory is in the background or the
+                        # overlay/main GUI is under the cursor.
                         target = self._discover_background_target(settings)
-                        now_background = time.monotonic()
-                        if (
-                            settings.hud_monitoring_enabled
-                            and target
-                            and not is_window_minimized(target[0])
-                            and now_background - self._last_background_capture >= self.BACKGROUND_CAPTURE_INTERVAL
-                        ):
-                            self._last_background_capture = now_background
-                            self._capture_target_frame(screen, settings, target[0], target[1], target[2])
 
                         _armed_now, disarmed_now = self._movement_gate.update(
                             False, time.monotonic(), settings.movement_hold_ms / 1000.0
                         )
                         if disarmed_now:
-                            self.emit_log("Ability spam paused because the target window lost focus.")
+                            self.emit_log("Auto-cast paused because the target window lost focus.")
                         self._next_ability_at = 0.0
+                        self._ability_cycle_idx = 0
                         self._typing_pause_active = False
+                        self._hud_scan_ready = False
                         if self._last_target_state != (self._last_target_hwnd, False):
                             self._last_target_state = (self._last_target_hwnd, False)
                             self.events.put(("target_window", {
@@ -1242,7 +1650,9 @@ class MonitorWorker(threading.Thread):
                                 "visible": self._last_target_visible,
                             }))
                         if target:
-                            self.emit_status("MapleStory Classic is in the background · passive capture active when visible")
+                            self.emit_status(
+                                "MapleStory Classic is in the background · waiting for focus"
+                            )
                         else:
                             self.emit_status("MapleStory is not running")
                         self._emit_telemetry(settings, focused=False, movement_detected=False)
@@ -1250,9 +1660,9 @@ class MonitorWorker(threading.Thread):
                     # Keep the loop light. Ability spam needs tighter key polling;
                     # otherwise prefer a longer sleep so the game and GUI stay smooth.
                     if settings.ability_spam_enabled:
-                        delay = 0.08
+                        delay = 0.10
                     else:
-                        delay = 0.25
+                        delay = 0.28
                     elapsed = time.monotonic() - started
                     self.stop_event.wait(max(0.0, delay - elapsed))
         except Exception as exc:
@@ -1357,60 +1767,109 @@ class GameOverlay:
         self.window.minsize(self.MIN_WIDTH, self.MIN_HEIGHT)
         self.window.maxsize(self.MAX_WIDTH, self.MAX_HEIGHT)
 
-        border = tk.Frame(self.window, bg="#555555", bd=0, highlightthickness=1, highlightbackground="#777777")
-        border.pack(fill="both", expand=True)
-        header = tk.Frame(border, bg="#303030", height=30)
-        header.pack(fill="x")
-        header.pack_propagate(False)
-        title = tk.Label(header, text="MSC HELPER  |  LIVE STATUS", bg="#303030", fg="#eeeeee",
-                         font=("Segoe UI Semibold", 9), anchor="w", padx=10)
-        title.pack(side="left", fill="both", expand=True)
-        self.connection_label = tk.Label(header, text="WAITING", bg="#303030", fg="#d6ad62",
-                                         font=("Segoe UI", 8, "bold"), padx=8)
-        self.connection_label.pack(side="right", fill="y")
-        for widget in (header, title, self.connection_label):
-            widget.bind("<ButtonPress-1>", self._start_drag)
-            widget.bind("<B1-Motion>", self._drag)
-            widget.bind("<ButtonRelease-1>", self._end_drag)
+        # Layout: footer first (always visible resize grip), then header, then body.
+        self._border = tk.Frame(self.window, bg="#555555", bd=0, highlightthickness=1, highlightbackground="#777777")
+        self._border.pack(fill="both", expand=True)
 
-        body = tk.Frame(border, bg="#1f1f1f", padx=14, pady=10)
-        body.pack(fill="both", expand=True)
-        self.hp_label = tk.Label(body, text="HP  |  WAITING FOR HUD", bg="#1f1f1f", fg="#f08080",
-                                 font=("Segoe UI Semibold", 10), anchor="w")
-        self.hp_label.pack(fill="x", pady=(0, 4))
-        self.hp_detail = tk.Label(body, text="— / —", bg="#1f1f1f", fg="#e5e5e5",
-                                  font=("Consolas", 10), anchor="w")
-        self.hp_detail.pack(fill="x", pady=(0, 6))
-        self.mp_label = tk.Label(body, text="MP  |  WAITING FOR HUD", bg="#1f1f1f", fg="#84c4a1",
-                                 font=("Segoe UI Semibold", 10), anchor="w")
-        self.mp_label.pack(fill="x", pady=(0, 4))
-        self.mp_detail = tk.Label(body, text="— / —", bg="#1f1f1f", fg="#e5e5e5",
-                                  font=("Consolas", 10), anchor="w")
-        self.mp_detail.pack(fill="x", pady=(0, 6))
-        self.listener_label = tk.Label(body, text="KEY LISTENER OFF", bg="#1f1f1f", fg="#a9a9a9",
-                                       font=("Segoe UI", 9), anchor="w")
-        self.listener_label.pack(fill="x", pady=(2, 3))
-        self.movement_label = tk.Label(body, text="", bg="#1f1f1f", fg="#e7c46d",
-                                       font=("Segoe UI Semibold", 9), anchor="w")
-        self.movement_label.pack(fill="x", pady=(0, 4))
-        self.commands_label = tk.Label(
-            body, text="ENABLED COMMANDS\n• None", bg="#1f1f1f", fg="#dddddd",
-            font=("Segoe UI", 9), anchor="nw", justify="left", wraplength=330
+        self._footer = tk.Frame(self._border, bg="#303030", height=20)
+        self._footer.pack(fill="x", side="bottom")
+        self._footer.pack_propagate(False)
+        self.footer_label = tk.Label(
+            self._footer,
+            text="Drag header to move  ·  Resize bottom-right",
+            bg="#303030",
+            fg="#a0a0a0",
+            font=("Segoe UI", 7),
+            anchor="w",
+            padx=8,
         )
-        self.commands_label.pack(fill="both", expand=True, pady=(2, 0))
-        footer = tk.Frame(border, bg="#303030", height=18)
-        footer.pack(fill="x", side="bottom")
-        footer.pack_propagate(False)
-        self.footer_label = tk.Label(footer, text="Drag header to move  ·  Resize bottom-right", bg="#303030",
-                                     fg="#a0a0a0", font=("Segoe UI", 7), anchor="w", padx=8)
         self.footer_label.pack(side="left", fill="both", expand=True)
-        self.grip = tk.Label(footer, text="◢", bg="#303030", fg="#cccccc", cursor="size_nw_se",
-                             font=("Segoe UI", 10), padx=5)
+        self.grip = tk.Label(
+            self._footer,
+            text="◢",
+            bg="#303030",
+            fg="#cccccc",
+            cursor="size_nw_se",
+            font=("Segoe UI", 10),
+            padx=6,
+        )
         self.grip.pack(side="right", fill="y")
         self.grip.bind("<ButtonPress-1>", self._start_resize)
         self.grip.bind("<B1-Motion>", self._resize)
         self.grip.bind("<ButtonRelease-1>", self._end_resize)
 
+        self._header = tk.Frame(self._border, bg="#303030", height=28)
+        self._header.pack(fill="x", side="top")
+        self._header.pack_propagate(False)
+        self.title_label = tk.Label(
+            self._header,
+            text="MSC HELPER  |  LIVE STATUS",
+            bg="#303030",
+            fg="#eeeeee",
+            font=("Segoe UI Semibold", 9),
+            anchor="w",
+            padx=10,
+        )
+        self.title_label.pack(side="left", fill="both", expand=True)
+        self.connection_label = tk.Label(
+            self._header,
+            text="WAITING",
+            bg="#303030",
+            fg="#d6ad62",
+            font=("Segoe UI", 8, "bold"),
+            padx=8,
+        )
+        self.connection_label.pack(side="right", fill="y")
+        for widget in (self._header, self.title_label, self.connection_label):
+            widget.bind("<ButtonPress-1>", self._start_drag)
+            widget.bind("<B1-Motion>", self._drag)
+            widget.bind("<ButtonRelease-1>", self._end_drag)
+
+        self._body = tk.Frame(self._border, bg="#1f1f1f", padx=10, pady=8)
+        self._body.pack(fill="both", expand=True)
+        self.hp_label = tk.Label(
+            self._body, text="HP  |  WAITING FOR HUD", bg="#1f1f1f", fg="#f08080",
+            font=("Segoe UI Semibold", 10), anchor="w",
+        )
+        self.hp_label.pack(fill="x", pady=(0, 2))
+        self.hp_detail = tk.Label(
+            self._body, text="— / —", bg="#1f1f1f", fg="#e5e5e5",
+            font=("Consolas", 10), anchor="w",
+        )
+        self.hp_detail.pack(fill="x", pady=(0, 4))
+        self.mp_label = tk.Label(
+            self._body, text="MP  |  WAITING FOR HUD", bg="#1f1f1f", fg="#84c4a1",
+            font=("Segoe UI Semibold", 10), anchor="w",
+        )
+        self.mp_label.pack(fill="x", pady=(0, 2))
+        self.mp_detail = tk.Label(
+            self._body, text="— / —", bg="#1f1f1f", fg="#e5e5e5",
+            font=("Consolas", 10), anchor="w",
+        )
+        self.mp_detail.pack(fill="x", pady=(0, 4))
+        self.listener_label = tk.Label(
+            self._body, text="KEY LISTENER OFF", bg="#1f1f1f", fg="#a9a9a9",
+            font=("Segoe UI", 9), anchor="w",
+        )
+        self.listener_label.pack(fill="x", pady=(2, 2))
+        self.movement_label = tk.Label(
+            self._body, text="", bg="#1f1f1f", fg="#e7c46d",
+            font=("Segoe UI Semibold", 9), anchor="w",
+        )
+        self.movement_label.pack(fill="x", pady=(0, 2))
+        self.commands_label = tk.Label(
+            self._body,
+            text="ENABLED COMMANDS\n• None",
+            bg="#1f1f1f",
+            fg="#dddddd",
+            font=("Segoe UI", 9),
+            anchor="nw",
+            justify="left",
+            wraplength=200,
+        )
+        self.commands_label.pack(fill="both", expand=True, pady=(2, 0))
+
+        # Keep layout fixed; minimum size prevents crushed widgets.
     @staticmethod
     def _win_api():
         if sys.platform != "win32":
@@ -1594,6 +2053,7 @@ class GameOverlay:
             except Exception as exc:
                 self.app._log(f"Could not show game overlay: {type(exc).__name__}: {exc}", "warning")
 
+
     def hide(self) -> None:
         if not self._is_shown and not self._attached:
             return
@@ -1681,12 +2141,13 @@ class GameOverlay:
         self._drag_start = None
         self._persist_geometry()
 
+
     def _start_resize(self, event) -> None:
-        if self._attached and self._focused:
+        if self._attached or self._is_shown:
             self._resize_start = (event.x_root, event.y_root, self._width, self._height)
 
     def _resize(self, event) -> None:
-        if not self._resize_start or not self._focused:
+        if not self._resize_start:
             return
         sx, sy, width, height = self._resize_start
         new_w = max(self.MIN_WIDTH, min(self.MAX_WIDTH, width + event.x_root - sx))
@@ -1774,6 +2235,123 @@ class ToolTip:
             self._tip = None
 
 
+
+def parse_version(value: str) -> tuple[int, ...]:
+    """Parse a dotted version string into a comparable integer tuple."""
+    parts = re.findall(r"\d+", (value or "").strip().lstrip("vV"))
+    return tuple(int(part) for part in parts) if parts else (0,)
+
+
+def is_newer_version(remote: str, local: str) -> bool:
+    """True only when remote is strictly greater than local (semver-ish)."""
+    return parse_version(remote) > parse_version(local)
+
+
+def read_bundled_version() -> str:
+    for candidate in (BASE_DIR / "VERSION", Path(getattr(sys, "_MEIPASS", BASE_DIR)) / "VERSION"):
+        try:
+            if candidate.is_file():
+                return candidate.read_text(encoding="utf-8").strip() or APP_VERSION
+        except OSError:
+            continue
+    return APP_VERSION
+
+
+def fetch_remote_version(timeout: float = 8.0) -> str | None:
+    try:
+        req = urllib.request.Request(
+            GITHUB_VERSION_URL,
+            headers={"User-Agent": f"MSC-Helper/{APP_VERSION}", "Accept": "text/plain"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace").strip()
+    except Exception:
+        return None
+
+
+def fetch_latest_release_asset(timeout: float = 12.0) -> tuple[str, str] | None:
+    """Return (download_url, tag_name) for the latest .exe asset, or None."""
+    try:
+        req = urllib.request.Request(
+            GITHUB_RELEASES_API,
+            headers={
+                "User-Agent": f"MSC-Helper/{APP_VERSION}",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        tag = str(data.get("tag_name") or data.get("name") or "").lstrip("v").strip()
+        assets = data.get("assets") or []
+        for asset in assets:
+            name = str(asset.get("name") or "").lower()
+            url = asset.get("browser_download_url")
+            if url and name.endswith(".exe"):
+                return str(url), tag or "latest"
+        # Fallback: any asset that looks like the main binary
+        for asset in assets:
+            name = str(asset.get("name") or "").lower()
+            url = asset.get("browser_download_url")
+            if url and "msc" in name:
+                return str(url), tag or "latest"
+    except Exception:
+        return None
+    return None
+
+
+def download_file(url: str, dest: Path, timeout: float = 120.0) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    req = urllib.request.Request(url, headers={"User-Agent": f"MSC-Helper/{APP_VERSION}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp, open(tmp, "wb") as out:
+        shutil.copyfileobj(resp, out)
+    tmp.replace(dest)
+
+
+def mark_installed_version(version: str) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        VERSION_MARK_PATH.write_text(version.strip() + "\n", encoding="utf-8")
+        # Remove legacy marker name if present.
+        legacy = CONFIG_DIR / "installed_version.txt"
+        if legacy.is_file() and legacy != VERSION_MARK_PATH:
+            try:
+                legacy.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def read_installed_version_mark() -> str | None:
+    try:
+        if VERSION_MARK_PATH.is_file():
+            return VERSION_MARK_PATH.read_text(encoding="utf-8").strip() or None
+        legacy = CONFIG_DIR / "installed_version.txt"
+        if legacy.is_file():
+            value = legacy.read_text(encoding="utf-8").strip() or None
+            if value:
+                mark_installed_version(value)
+            return value
+    except OSError:
+        pass
+    return None
+
+
+def is_frozen_exe() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def current_executable_path() -> Path | None:
+    if is_frozen_exe():
+        return Path(sys.executable).resolve()
+    # Development / source run – look for a nearby built exe.
+    for candidate in (BASE_DIR / "dist" / "MSCHelper.exe", BASE_DIR / "MSCHelper.exe"):
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
 class MapleHelperApp:
     BG = "#171717"
     PANEL = "#242424"
@@ -1788,13 +2366,14 @@ class MapleHelperApp:
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title(APP_NAME)
+        self.root.title(f"{APP_NAME}  v{APP_VERSION}")
         self.root.geometry("1020x720")
         self.root.minsize(900, 700)
         self.root.configure(bg=self.BG)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         # Use the bundled multi-size .ico for the main window (and later the overlay).
         icon_path = BASE_DIR / "icon.ico"
+        self._app_icon_path = icon_path
         if icon_path.is_file():
             try:
                 self.root.iconbitmap(default=str(icon_path))
@@ -1803,6 +2382,11 @@ class MapleHelperApp:
                     self.root.iconbitmap(str(icon_path))
                 except Exception:
                     pass
+            # Extra fallback for some Tk builds that ignore iconbitmap on the main window.
+            try:
+                self.root.wm_iconbitmap(str(icon_path))
+            except Exception:
+                pass
         self.events: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
         self.force_ocr_event = threading.Event()
@@ -1826,10 +2410,16 @@ class MapleHelperApp:
                 except Exception:
                     pass
         self._restore_last_capture_snapshot()
+        try:
+            setup_file_logging()
+            get_logger().info("UI initialized (v%s)", APP_VERSION)
+        except Exception:
+            pass
         self.root.after(80, self._process_events)
         self.root.after(250, self._start_worker)
         # Paint the overlay on a slow independent timer so it never contends with the game.
         self.root.after(1000, self._refresh_overlay)
+        self.root.after(3000, self._schedule_auto_update_check)
         self._set_status("Searching for MapleStory.exe", self.AMBER)
         if DEPENDENCY_ERROR is not None:
             self._log("Missing screen-capture dependency. Run: python -m pip install -r requirements.txt", "warning")
@@ -2014,7 +2604,7 @@ class MapleHelperApp:
     def _make_meter_card(self, parent, title: str, color: str, kind: str):
         card = self._card(parent, title)
         inner = card.inner
-        readout = ttk.Label(inner, text=f"{kind}  — / —", style="PanelTitle.TLabel")
+        readout = ttk.Label(inner, text=f"{kind.upper()}  — / —", style="PanelTitle.TLabel")
         readout.pack(anchor="w", pady=(2, 8))
         meter = Meter(inner, color, bg=self.PANEL, height=14)
         meter.pack(fill="x", pady=(0, 8))
@@ -2200,6 +2790,7 @@ class MapleHelperApp:
         self.movement_keys_var = tk.StringVar(value=self.current_settings.movement_keys)
         self.ability_keys_var = tk.StringVar(value=self.current_settings.ability_keys)
         self.ability_interval_var = tk.StringVar(value=str(self.current_settings.ability_interval_ms))
+        self.ability_set_delay_var = tk.StringVar(value=str(self.current_settings.ability_set_delay_ms))
         self.movement_hold_var = tk.StringVar(value=str(self.current_settings.movement_hold_ms))
         self.pause_typing_var = tk.BooleanVar(value=self.current_settings.pause_spam_while_typing)
 
@@ -2225,7 +2816,13 @@ class MapleHelperApp:
             card.inner,
             "Delay between each cast (ms)",
             self.ability_interval_var,
-            tooltip="Average interval between auto-cast key presses. Lower = faster spam. Recommended: 25-75 ms.",
+            tooltip="Interval between individual ability key presses within a set. Lower = faster casting. Recommended: 50-150 ms.",
+        )
+        self._entry_field(
+            card.inner,
+            "Delay after ability set (ms)",
+            self.ability_set_delay_var,
+            tooltip="Pause after finishing one full pass of the ability keys (e.g. after Q, E, R) before starting the set again. Recommended: 500-1500 ms.",
         )
         self._entry_field(
             card.inner,
@@ -2251,8 +2848,8 @@ class MapleHelperApp:
             card.inner,
             text="Auto-casting listens for configured movement keys (W, A, S, D by default; also supports Space, "
                  "Ctrl, Shift, Alt, arrows, and function keys) to detect when you are moving. "
-                 "While moving, it repeatedly presses the ability keys. You can also bind a pickup key to "
-                 "automatically collect items while walking.",
+                 "While moving, it presses the ability keys in order, then waits the set delay before repeating. "
+                 "You can also bind a pickup key to automatically collect items while walking.",
             style="PanelMuted.TLabel",
             wraplength=700,
             justify="left",
@@ -2284,7 +2881,8 @@ class MapleHelperApp:
         ttk.Label(
             card.inner,
             text="The overlay is owned by the MapleStory window and does not steal focus. "
-                 "It is automatically hidden when the game is minimized or closed.",
+                 "It is automatically hidden when the game is minimized or closed. "
+                 "Drag the header to move; use the bottom-right grip to resize.",
             style="PanelMuted.TLabel",
             wraplength=700,
         ).pack(anchor="w", pady=(8, 0))
@@ -2305,6 +2903,8 @@ class MapleHelperApp:
         self.key_press_var = tk.StringVar(value=str(self.current_settings.key_hold_ms))
         self.auto_detect_var = tk.BooleanVar(value=self.current_settings.auto_detect_max_stats)
         self.hud_monitoring_var = tk.BooleanVar(value=self.current_settings.hud_monitoring_enabled)
+        self.passive_hud_var = tk.BooleanVar(value=self.current_settings.passive_hud_reading)
+        self.min_focus_hold_var = tk.StringVar(value=str(self.current_settings.min_focus_hold_ms))
 
         self._entry_field(
             target.inner,
@@ -2330,6 +2930,12 @@ class MapleHelperApp:
             "Key hold duration (ms)",
             self.key_press_var,
             tooltip="How long each simulated key is held down. Increase if keys are occasionally missed. Recommended: 75 ms.",
+        )
+        self._entry_field(
+            target.inner,
+            "Minimum focus hold before input (ms)",
+            self.min_focus_hold_var,
+            tooltip="The game must stay focused for at least this long before any key is sent. Prevents inputs when briefly tabbing in/out. Recommended: 1000 ms.",
         )
 
         mon_row = ttk.Frame(target.inner, style="Panel.TFrame")
@@ -2357,6 +2963,45 @@ class MapleHelperApp:
             ocr_row,
             "Uses Tesseract to read exact current/max numbers from the HUD. Disable if you experience lag; bar-fill estimation will still work. Recommended: enabled.",
         )
+
+        passive_row = ttk.Frame(target.inner, style="Panel.TFrame")
+        passive_row.pack(anchor="w", fill="x", pady=(2, 5))
+        ttk.Checkbutton(
+            passive_row,
+            text="Enable passive HUD reading while game is in the background",
+            variable=self.passive_hud_var,
+            command=self._on_feature_toggle,
+        ).pack(side="left")
+        self._add_info_icon(
+            passive_row,
+            "Samples HP/MP while MapleStory is visible but not focused. Background reads can under-report fill and cause unwanted potions when you tab back in. Recommended: disabled.",
+        )
+
+        update_card = self._card(self.general_tab, "Updates")
+        update_card.pack(fill="x", pady=(0, 10))
+        self.auto_update_var = tk.BooleanVar(value=self.current_settings.auto_update_enabled)
+        upd_row = ttk.Frame(update_card.inner, style="Panel.TFrame")
+        upd_row.pack(anchor="w", fill="x")
+        ttk.Checkbutton(
+            upd_row,
+            text="Automatically check for and install updates",
+            variable=self.auto_update_var,
+            command=self._on_feature_toggle,
+        ).pack(side="left")
+        self._add_info_icon(
+            upd_row,
+            "When enabled, MSC Helper compares the local version with the latest release on GitHub and can download a new executable. Disable if you prefer manual updates.",
+        )
+        ttk.Label(
+            update_card.inner,
+            text=f"Current version: {APP_VERSION}",
+            style="PanelMuted.TLabel",
+        ).pack(anchor="w", pady=(6, 0))
+        ttk.Button(
+            update_card.inner,
+            text="Check for updates now",
+            command=self._check_for_updates_manual,
+        ).pack(anchor="w", pady=(8, 0))
 
         actions = ttk.Frame(self.general_tab)
         actions.pack(fill="x", pady=(0, 10))
@@ -2414,6 +3059,7 @@ class MapleHelperApp:
             self.ability_enabled_var.set(current.ability_spam_enabled)
             self.hud_monitoring_var.set(current.hud_monitoring_enabled)
             self.auto_detect_var.set(current.auto_detect_max_stats)
+            self.passive_hud_var.set(current.passive_hud_reading)
             self.pause_typing_var.set(current.pause_spam_while_typing)
 
     def _on_overlay_toggle(self) -> None:
@@ -2450,6 +3096,189 @@ class MapleHelperApp:
             self._log("Live status overlay enabled.", "success")
             if self.overlay.target_rect:
                 self.overlay.show_on_target(force=True)
+
+    def _check_for_updates_manual(self) -> None:
+        threading.Thread(target=self._run_update_check, args=(True,), daemon=True, name="UpdateCheck").start()
+
+    def _schedule_auto_update_check(self) -> None:
+        if not self._settings_snapshot().auto_update_enabled:
+            return
+        self.root.after(2500, lambda: threading.Thread(
+            target=self._run_update_check, args=(False,), daemon=True, name="AutoUpdate"
+        ).start())
+
+    def _ask_update_confirm(self, remote: str, local: str) -> bool:
+        """Show a modal confirm dialog on the UI thread and return the answer."""
+        result: queue.Queue = queue.Queue(maxsize=1)
+
+        def _ask() -> None:
+            ok = messagebox.askyesno(
+                "Updates",
+                f"There is a new version {remote} (you have {local}).\n\nDo you want to update?",
+                parent=self.root,
+            )
+            result.put(bool(ok))
+
+        self.root.after(0, _ask)
+        try:
+            return bool(result.get(timeout=300))
+        except Exception:
+            return False
+
+    def _show_update_progress(self, title: str = "Updating MSC Helper") -> tuple[tk.Toplevel, ttk.Progressbar, tk.Label]:
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.geometry("420x140")
+        win.resizable(False, False)
+        win.transient(self.root)
+        try:
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+        try:
+            if self._app_icon_path.is_file():
+                win.iconbitmap(str(self._app_icon_path))
+        except Exception:
+            pass
+        frame = ttk.Frame(win, padding=16)
+        frame.pack(fill="both", expand=True)
+        label = ttk.Label(frame, text="Preparing update…", wraplength=380)
+        label.pack(anchor="w", pady=(0, 10))
+        bar = ttk.Progressbar(frame, mode="indeterminate", length=380)
+        bar.pack(fill="x")
+        bar.start(12)
+        win.update_idletasks()
+        return win, bar, label
+
+    def _set_progress_status(self, label: tk.Label, text: str) -> None:
+        def _apply() -> None:
+            try:
+                label.configure(text=text)
+            except tk.TclError:
+                pass
+        self.root.after(0, _apply)
+
+    def _run_update_check(self, manual: bool) -> None:
+        progress_win: tk.Toplevel | None = None
+        progress_bar: ttk.Progressbar | None = None
+        progress_label: tk.Label | None = None
+        try:
+            local = read_bundled_version()
+            remote = fetch_remote_version()
+            if remote is None:
+                msg = "Could not reach GitHub to check for updates."
+                self.events.put(("log", msg))
+                if manual:
+                    self.root.after(0, lambda: messagebox.showwarning("Updates", msg, parent=self.root))
+                return
+
+            get_logger().info("Version check: local=%s remote=%s", local, remote)
+
+            # Only treat remote as an update when it is strictly newer.
+            if not is_newer_version(remote, local):
+                msg = f"You are up to date (v{local})."
+                if remote != local:
+                    msg = f"You are up to date (v{local}). Remote reports v{remote}, which is not newer."
+                self.events.put(("log", msg))
+                mark_installed_version(local)
+                if manual:
+                    self.root.after(0, lambda m=msg: messagebox.showinfo("Updates", m, parent=self.root))
+                return
+
+            self.events.put(("log", f"Update available: v{remote} (you have v{local})."))
+
+            # Always ask before installing — never auto-install silently.
+            if not self._ask_update_confirm(remote, local):
+                self.events.put(("log", "Update declined by user."))
+                return
+
+            asset = fetch_latest_release_asset()
+            if not asset:
+                msg = (
+                    f"Version {remote} is available but no downloadable executable was found "
+                    "on the release page.\n\n"
+                    "Open https://github.com/zgndia/MSC-Helper/releases to download manually."
+                )
+                self.events.put(("log", msg.split("\n")[0]))
+                self.root.after(0, lambda m=msg: messagebox.showinfo("Updates", m, parent=self.root))
+                return
+
+            url, tag = asset
+            exe_path = current_executable_path()
+            if exe_path is None or not is_frozen_exe():
+                msg = (
+                    f"A newer version (v{remote}) is available.\n"
+                    f"Download it from:\n{url}\n\n"
+                    "Automatic replacement only works when running the packaged MSCHelper.exe."
+                )
+                self.events.put(("log", f"Update available: {url}"))
+                self.root.after(0, lambda m=msg: messagebox.showinfo("Updates", m, parent=self.root))
+                return
+
+            # Show progress UI on the main thread.
+            ready: queue.Queue = queue.Queue(maxsize=1)
+
+            def _open_progress() -> None:
+                win, bar, label = self._show_update_progress(f"Updating to v{remote}")
+                ready.put((win, bar, label))
+
+            self.root.after(0, _open_progress)
+            progress_win, progress_bar, progress_label = ready.get(timeout=30)
+
+            download_dir = CONFIG_DIR / "updates"
+            target = download_dir / f"MSCHelper_{tag}.exe"
+            self.events.put(("log", f"Downloading update v{remote}…"))
+            self._set_progress_status(progress_label, f"Downloading MSC Helper v{remote}…")
+            download_file(url, target)
+
+            self._set_progress_status(progress_label, "Preparing installer…")
+            replace_bat = download_dir / "apply_update.bat"
+            bat_lines = [
+                "@echo off",
+                "timeout /t 2 /nobreak >nul",
+                f'copy /y "{target}" "{exe_path}"',
+                "if errorlevel 1 exit /b 1",
+                f'start "" "{exe_path}"',
+                'del "%~f0"',
+            ]
+            replace_bat.write_text("\r\n".join(bat_lines) + "\r\n", encoding="utf-8")
+            mark_installed_version(remote)
+            self.events.put(("log", f"Update v{remote} downloaded. Restarting to apply…"))
+            self._set_progress_status(progress_label, "Installing and restarting…")
+
+            flags = 0
+            if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                flags |= subprocess.CREATE_NO_WINDOW
+            if hasattr(subprocess, "DETACHED_PROCESS"):
+                flags |= subprocess.DETACHED_PROCESS
+            subprocess.Popen(
+                ["cmd", "/c", str(replace_bat)],
+                cwd=str(download_dir),
+                creationflags=flags,
+                close_fds=True,
+            )
+            self.root.after(500, self.on_close)
+        except Exception as exc:
+            get_logger().exception("Update check failed")
+            self.events.put(("log", f"Update check failed: {type(exc).__name__}: {exc}"))
+            self.root.after(
+                0,
+                lambda: messagebox.showerror(
+                    "Updates", f"Update check failed:\n{exc}", parent=self.root
+                ),
+            )
+        finally:
+            if progress_bar is not None:
+                try:
+                    self.root.after(0, progress_bar.stop)
+                except Exception:
+                    pass
+            if progress_win is not None:
+                try:
+                    self.root.after(0, progress_win.destroy)
+                except Exception:
+                    pass
+
 
     def _parse_settings(self) -> Settings:
         def integer(value: str, name: str, minimum: int, maximum: int) -> int:
@@ -2521,13 +3350,16 @@ class MapleHelperApp:
             potion_cooldown_ms=integer(self.cooldown_var.get(), "Potion cooldown", 100, 60_000),
             hud_scan_interval_ms=integer(self.scan_interval_var.get(), "HUD scan interval", 200, 10_000),
             key_hold_ms=integer(self.key_press_var.get(), "Base key hold", 30, 3_000),
+            min_focus_hold_ms=integer(self.min_focus_hold_var.get(), "Minimum focus hold", 0, 30_000),
             auto_detect_max_stats=bool(self.auto_detect_var.get()),
             hud_monitoring_enabled=bool(self.hud_monitoring_var.get()),
+            passive_hud_reading=bool(self.passive_hud_var.get()),
             ocr_interval_ms=max(800, int(self.current_settings.ocr_interval_ms or 1800)),
             ability_spam_enabled=ability_enabled,
             ability_keys=ability_keys_text,
             movement_keys=movement_key_names,
-            ability_interval_ms=integer(self.ability_interval_var.get(), "Ability repeat interval", 25, 10_000),
+            ability_interval_ms=integer(self.ability_interval_var.get(), "Delay between each cast", 25, 10_000),
+            ability_set_delay_ms=integer(self.ability_set_delay_var.get(), "Delay after ability set", 0, 60_000),
             movement_hold_ms=integer(self.movement_hold_var.get(), "Movement hold gate", 100, 30_000),
             pause_spam_while_typing=bool(self.pause_typing_var.get()),
             overlay_enabled=bool(self.overlay_enabled_var.get()),
@@ -2535,6 +3367,7 @@ class MapleHelperApp:
             overlay_y_offset=self.current_settings.overlay_y_offset,
             overlay_width=self.current_settings.overlay_width,
             overlay_height=self.current_settings.overlay_height,
+            auto_update_enabled=bool(self.auto_update_var.get()),
             last_window_title=self.current_settings.last_window_title,
             last_window_pid=self.current_settings.last_window_pid,
             last_window_hwnd=self.current_settings.last_window_hwnd,
@@ -2549,6 +3382,31 @@ class MapleHelperApp:
             else:
                 self._log(f"Setting not applied: {exc}", "warning")
             return False
+        # Auto-pot depends on HUD monitoring. OCR/Tesseract stays user-controlled.
+        if settings.hp_enabled or settings.mp_enabled:
+            if not settings.hud_monitoring_enabled:
+                settings = replace(settings, hud_monitoring_enabled=True)
+                try:
+                    self.hud_monitoring_var.set(True)
+                except Exception:
+                    pass
+                self._log(
+                    "HUD monitoring enabled because an auto-pot toggle is on.",
+                    "success",
+                )
+        else:
+            # Both auto-pot toggles off → disable HUD monitoring only.
+            # Tesseract toggle is never touched; OCR is inert while HUD is off.
+            if settings.hud_monitoring_enabled:
+                settings = replace(settings, hud_monitoring_enabled=False)
+                try:
+                    self.hud_monitoring_var.set(False)
+                except Exception:
+                    pass
+                self._log(
+                    "HUD monitoring disabled because both auto-pot toggles are off.",
+                    "success",
+                )
         with self.settings_lock:
             self.current_settings = settings
         # Apply in-memory immediately; disk write is debounced so toggles stay snappy.
@@ -2595,7 +3453,9 @@ class MapleHelperApp:
         self.cooldown_var.set(str(s.potion_cooldown_ms))
         self.scan_interval_var.set(str(s.hud_scan_interval_ms))
         self.key_press_var.set(str(s.key_hold_ms))
+        self.min_focus_hold_var.set(str(s.min_focus_hold_ms))
         self.auto_detect_var.set(s.auto_detect_max_stats)
+        self.passive_hud_var.set(s.passive_hud_reading)
         for variables, settings_values in (
             (self.hp_vars, (s.max_hp, s.hp_threshold, s.hp_random_offset, s.hp_key)),
             (self.mp_vars, (s.max_mp, s.mp_threshold, s.mp_random_offset, s.mp_key)),
@@ -2610,9 +3470,11 @@ class MapleHelperApp:
         self.movement_keys_var.set(s.movement_keys)
         self.ability_keys_var.set(s.ability_keys)
         self.ability_interval_var.set(str(s.ability_interval_ms))
+        self.ability_set_delay_var.set(str(s.ability_set_delay_ms))
         self.movement_hold_var.set(str(s.movement_hold_ms))
         self.pause_typing_var.set(s.pause_spam_while_typing)
         self.overlay_enabled_var.set(s.overlay_enabled)
+        self.auto_update_var.set(s.auto_update_enabled)
         self.hud_monitoring_var.set(s.hud_monitoring_enabled)
 
     def persist_overlay_geometry(self, x: int, y: int, width: int, height: int) -> None:
@@ -3004,8 +3866,8 @@ class MapleHelperApp:
                 if readout.cget("text") != text:
                     readout.configure(text=text)
             if data.get(f"{kind}_fresh") and data.get("focused"):
-                if freshness.cget("text") != f"TRACKING {kind}":
-                    freshness.configure(text=f"TRACKING {kind}", foreground=self.GREEN)
+                if freshness.cget("text") != f"TRACKING {kind.upper()}":
+                    freshness.configure(text=f"TRACKING {kind.upper()}", foreground=self.GREEN)
             elif data.get(f"{kind}_last_seen"):
                 text = f"LAST SEEN  {data[f'{kind}_last_seen']}"
                 if freshness.cget("text") != text:
@@ -3049,6 +3911,11 @@ class MapleHelperApp:
         self.status_badge.configure(text=label, fg=color)
 
     def _log(self, text: str, tag: str = "event") -> None:
+        try:
+            level = logging.WARNING if tag == "warning" else logging.INFO
+            get_logger().log(level, text)
+        except Exception:
+            pass
         if not hasattr(self, "log"):
             return
         timestamp = datetime.now().strftime("%H:%M:%S")

@@ -1,19 +1,21 @@
 # MSC Helper
 
-**Release:** `0.1.0`  
+**Release:** `0.2.0`  
 **MapleStory Classic Helper** — an input automation tool for MapleStory Classic.
 
-MSC Helper offers automatic potion and ability casting.
+MSC Helper offers automatic potion use and ordered ability casting with a live in-game overlay.
 
 ## Installation
 
 1. Install the latest release from the [Releases](https://github.com/zgndia/MSC-Helper/releases) page.
 2. Install [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) for best accuracy (recommended).
-3. Run this one-line command to add Tesseract OCR to your path in powershell
+3. Run this one-line command to add Tesseract OCR to your path in PowerShell:
+
 ```cmd
 [Environment]::SetEnvironmentVariable("Path", $env:Path + ";C:\Program Files\Tesseract-OCR", "User")
 ```
-4. Restart powershell and run `tesseract --version` to verify. If you can see your tesseract version, you are good to go.
+
+4. Restart PowerShell and run `tesseract --version` to verify.
 5. Launch `MSCHelper.exe` and MapleStory Classic.
 
 Administrator elevation is required for reliable input delivery.
@@ -27,8 +29,11 @@ Administrator elevation is required for reliable input delivery.
 - Passive desktop capture; does not steal focus.
 - Cached HUD region after first successful scan for lower CPU use.
 - Auto-pot with threshold (missing points or remaining %) plus random offset.
-- Auto-Casting abilities/interactions.
-- In-game overlay for tracking.
+- Configurable minimum focus-hold before any input; optional passive background HUD reading (off by default).
+- Auto-Casting: presses ability keys in sequence, with separate delays between keys and after a full set.
+- Live status overlay (resizable).
+- Automatic update checks (can be disabled under Settings).
+- Activity log in the UI and file logs under `%APPDATA%\MSCHelper\logs\` (`latest.log` + dated rotating logs).
 
 ## Requirements
 
@@ -62,7 +67,7 @@ Produces `dist\MSCHelper.exe` (one-file, windowed, admin manifest, bundled icon 
 
 ## Configuration
 
-Settings and the last HP/MP snapshot are stored under:
+Settings, the last HP/MP snapshot, logs, and update marks are stored under:
 
 ```
 %APPDATA%\MSCHelper\
@@ -71,6 +76,15 @@ Settings and the last HP/MP snapshot are stored under:
 Use **Settings → Go to file location** inside the app, or open that folder manually.
 
 Most options ship with safe defaults. Prefer leaving cooldown, scan interval, and key-hold values at their recommended defaults unless you have a specific reason to change them.
+
+### Auto-cast delays
+
+- **Delay between each cast** — pause between individual keys in the ability list (e.g. after Q before E).
+- **Delay after ability set** — longer pause after the full list has been pressed once before the cycle restarts.
+
+### Updates
+
+When auto-update is enabled (default), the helper compares its local version with the `VERSION` file on GitHub and, if newer, downloads the latest release executable and restarts to apply it. You can disable this under the **Settings** tab.
 
 ## Project layout
 
@@ -89,6 +103,6 @@ VERSION                 Release version
 
 - Windows-only; expects process name `MapleStory.exe`.
 - Exact numeric readings need Tesseract and a HUD layout similar to the supplied reference assets.
-- Passive capture only sees pixels Windows exposes; minimized or exclusive-fullscreen content may not be readable.
+- Desktop capture only sees pixels Windows exposes; minimized or exclusive-fullscreen content may not be readable.
 - External overlays may not appear in exclusive-fullscreen modes — use windowed or borderless.
 - No anti-cheat bypass is attempted. Review the game’s rules before using input automation.

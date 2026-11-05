@@ -64,7 +64,7 @@ else:
     DETECTOR_IMPORT_ERROR = None
 
 APP_NAME = "MSC Helper"
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "MSCHelper"
 CONFIG_PATH = CONFIG_DIR / "settings.json"
@@ -3202,7 +3202,7 @@ class MapleHelperApp:
         def _ask() -> None:
             ok = messagebox.askyesno(
                 "Updates",
-                f"There is a new version {remote} (you have {local}).\n\nDo you want to update?",
+                f"There is a new version {remote} (your version is {local}).\n\nDo you want to update?",
                 parent=self.root,
             )
             result.put(bool(ok))
@@ -3212,6 +3212,55 @@ class MapleHelperApp:
             return bool(result.get(timeout=300))
         except Exception:
             return False
+
+    def _ask_disable_auto_update(self) -> bool:
+        """Ask whether to disable automatic update checks (UI thread)."""
+        result: queue.Queue = queue.Queue(maxsize=1)
+
+        def _ask() -> None:
+            ok = messagebox.askyesno(
+                "Updates",
+                "You declined the update.\n\n"
+                "Do you want to disable automatic update checks?\n"
+                "(You can still use \"Check for updates now\" anytime.)",
+                parent=self.root,
+            )
+            result.put(bool(ok))
+
+        self.root.after(0, _ask)
+        try:
+            return bool(result.get(timeout=300))
+        except Exception:
+            return False
+
+    def _offer_disable_auto_update(self) -> None:
+        """If the user confirms, turn off auto-update and persist the setting."""
+        if not self._ask_disable_auto_update():
+            return
+        try:
+            with self.settings_lock:
+                updated = replace(self.current_settings, auto_update_enabled=False)
+                self.current_settings = updated
+            try:
+                self.auto_update_var.set(False)
+            except Exception:
+                pass
+            try:
+                save_settings(updated)
+            except OSError as exc:
+                get_logger().warning("Could not save auto-update preference: %s", exc)
+            self.events.put(("log", "Automatic update checks disabled."))
+            self.root.after(
+                0,
+                lambda: messagebox.showinfo(
+                    "Updates",
+                    "Automatic update checks have been disabled.\n"
+                    "You can re-enable them under Settings at any time.",
+                    parent=self.root,
+                ),
+            )
+        except Exception:
+            get_logger().exception("Failed to disable auto-update")
 
     def _show_update_progress(self, title: str = "Updating MSC Helper") -> tuple[tk.Toplevel, ttk.Progressbar, tk.Label]:
         win = tk.Toplevel(self.root)
@@ -3278,6 +3327,9 @@ class MapleHelperApp:
             # Always ask before installing — never auto-install silently.
             if not self._ask_update_confirm(remote, local):
                 self.events.put(("log", "Update declined by user."))
+                # For automatic (startup) prompts only: offer to turn off auto-update.
+                if not manual:
+                    self._offer_disable_auto_update()
                 return
 
             asset = fetch_latest_release_asset()
@@ -3321,11 +3373,24 @@ class MapleHelperApp:
 
             self._set_progress_status(progress_label, "Preparing installer…")
             replace_bat = download_dir / "apply_update.bat"
+            # Clear PyInstaller onefile env vars so the restarted process is treated
+            # as a fresh parent (avoids "invalid originating onefile parent process
+            # (PID not found!)" security validation failure).
             bat_lines = [
                 "@echo off",
-                "timeout /t 2 /nobreak >nul",
+                "setlocal",
+                "timeout /t 3 /nobreak >nul",
                 f'copy /y "{target}" "{exe_path}"',
                 "if errorlevel 1 exit /b 1",
+                "rem Strip PyInstaller onefile inheritance markers so the new process",
+                "rem is treated as a fresh parent (avoids PID-not-found security error).",
+                'set "_MEIPASS="',
+                'set "_MEIPASS2="',
+                'set "_PYI_APPLICATION_HOME_DIR="',
+                'set "_PYI_PARENT_PROCESS_LEVEL="',
+                'set "_PYI_LINUX_PROCESS_NAME="',
+                'set "_PYI_SPLASH_IPC="',
+                'set "PYINSTALLER_SUPPRESS_SPLASH_SCREEN="',
                 f'start "" "{exe_path}"',
                 'del "%~f0"',
             ]
@@ -3339,13 +3404,25 @@ class MapleHelperApp:
                 flags |= subprocess.CREATE_NO_WINDOW
             if hasattr(subprocess, "DETACHED_PROCESS"):
                 flags |= subprocess.DETACHED_PROCESS
+            # Also strip the markers from the environment passed to the helper bat.
+            clean_env = {
+                k: v
+                for k, v in os.environ.items()
+                if not (
+                    k.startswith("_MEI")
+                    or k.startswith("_PYI")
+                    or k == "PYINSTALLER_SUPPRESS_SPLASH_SCREEN"
+                )
+            }
             subprocess.Popen(
                 ["cmd", "/c", str(replace_bat)],
                 cwd=str(download_dir),
+                env=clean_env,
                 creationflags=flags,
                 close_fds=True,
             )
-            self.root.after(500, self.on_close)
+            # Give the bat time to start and the copy to finish before we exit.
+            self.root.after(800, self.on_close)
         except Exception as exc:
             get_logger().exception("Update check failed")
             self.events.put(("log", f"Update check failed: {type(exc).__name__}: {exc}"))

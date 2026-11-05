@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.2 — Auto-update UX and relaunch fix
+
+- When an **automatic** update prompt is declined, the helper now asks whether to disable auto-updating (manual “Check for updates now” is unaffected).
+- Fixed post-update relaunch failure: `Security validation failure: invalid originating onefile parent process (PID not found!)`. The updater batch and its process environment now clear PyInstaller onefile inheritance variables (`_MEIPASS`, `_PYI_*`, etc.) so the new process starts as a clean parent.
+
 ## 0.2.1 — Overlay interaction & HUD read hotfix
 
 - Overlay can be dragged and resized again (no longer requires the internal “focused” flag).

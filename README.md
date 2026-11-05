@@ -10,7 +10,7 @@
 - Game overlay to see toggled commands, HUD monitoring, etc. (Can be toggled off)
 - Settings for commands and general settings for maximum configurability.
 - Monitors the in-game HUD to track your current and max Mana and Health.
-- Offers auto-uptades and logging.
+- Offers auto-updates and logging.
 
 ## Requirements
 

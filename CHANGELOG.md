@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0 — GUI Rewrite in Rust
+
+- The main Tkinter GUI has been replaced with a Rust based GUI.
+- Stuttering issues because of the gui is fixed; less memory usage, no lag.
+- Bug fixes, optimization fixes, etc.
+
 ## 0.2.2 — Auto-update UX and relaunch fix
 
 - When an **automatic** update prompt is declined, the helper now asks whether to disable auto-updating (manual “Check for updates now” is unaffected).

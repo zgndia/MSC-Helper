@@ -9,14 +9,16 @@ __pycache__/
 .eggs/
 *.egg
 
+# Rust
+msc-helper-gui/target/
+**/Cargo.lock
+
 # Local / generated
 *.log
 .venv/
 venv/
 env/
+searched_images/
 
 # App data / local config (user-specific)
 # (settings live under %APPDATA%\MSCHelper on Windows)
-
-# Launcher listed in release checklist
-run_autopot.bat

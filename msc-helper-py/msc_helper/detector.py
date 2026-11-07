@@ -66,7 +66,7 @@ class BarDetector:
 
     def __init__(self, assets_dir: str | Path | None = None) -> None:
         if assets_dir is None:
-            assets_dir = Path(__file__).resolve().parent / "assets"
+            assets_dir = Path(__file__).resolve().parent.parent / "assets"
         assets_dir = Path(assets_dir)
         self.templates: dict[BarKind, _Template] = {
             "hp": self._load_template(assets_dir / "hp_reference.png", "hp"),

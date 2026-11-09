@@ -33,7 +33,7 @@ def current_executable_path() -> Path | None:
 
 
 def find_rust_gui_binary() -> Path | None:
-    """Locate the optional Rust primary-GUI sidecar."""
+    """Locate the optional Rust GUI sidecar."""
     names = ("msc-helper-gui.exe", "msc_helper_gui.exe", "MSCHelperGui.exe")
     search_roots = [
         resource_dir(),
@@ -60,7 +60,7 @@ def find_rust_gui_binary() -> Path | None:
 
 
 def launch_rust_gui() -> subprocess.Popen | None:
-    """Start the Rust primary GUI as a child process. Returns the Popen handle or None."""
+    """Start the Rust GUI as a child process. Returns the Popen handle or None."""
     binary = find_rust_gui_binary()
     if binary is None:
         return None

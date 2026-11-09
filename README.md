@@ -8,7 +8,7 @@
 - Auto-potting — use HP and MP pots when necessary.
 - Auto-casting — cast abilities on an interval (e.g. Nimble Feet, Recovery).
 - Live **game overlay** for toggled commands and HUD status (can be turned off).
-- **Rust primary GUI** for settings and status (required).
+- **Rust GUI** for settings and status (required).
 - HUD monitoring for current / max HP and MP (bar fill + optional Tesseract OCR).
 - Auto-updates and file logging under AppData.
 
@@ -18,9 +18,9 @@
 - Python 3.10+ (for source runs)
 - Tesseract OCR (recommended, for best accuracy)
 - Dependencies in `requirements.txt` plus [native-inputs](https://github.com/zgndia/native-inputs) (source runs)
-- [Rust toolchain](https://rustup.rs/) to build the primary GUI, **or** a pre-built `msc-helper-gui.exe`
+- [Rust toolchain](https://rustup.rs/) to build the GUI, **or** a pre-built `msc-helper-gui.exe`
 
-## Installation (release)
+## Installation
 
 1. Install the latest build from [Releases](https://github.com/zgndia/MSC-Helper/releases).
 2. Install [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) (recommended).
@@ -42,7 +42,7 @@ python -m pip install -r requirements.txt
 python -m pip install native-inputs
 ```
 
-Build the primary GUI once:
+Build the GUI once:
 
 ```cmd
 cd msc-helper-gui
@@ -59,7 +59,7 @@ python msc-helper-py/main.py
 Or use `run.bat` (prefers `dist\MSCHelper.exe` if present, otherwise `pythonw`).
 
 The Python process stays **headless**: it owns the worker, control server, and
-game overlay. The **Rust window** is the only primary UI. If `msc-helper-gui.exe`
+game overlay. The **Rust window** is required. If `msc-helper-gui.exe`
 cannot be found, the app reports an error and exits.
 
 ## Building a release executable
@@ -116,10 +116,10 @@ msc-helper-py/msc_helper/        Backend package
   overlay.py                     Live game overlay
   updates.py                     Version / update download helpers
   runtime.py                     Frozen-exe + Rust GUI launch
-  app_ui.py                      Legacy Tk construction (unused primary UI)
+  app_ui.py                      Legacy Tk construction
   app_updates.py                 In-app update flow
   app.py                         MapleHelperApp (wires backend + overlay)
-msc-helper-gui/                  Primary GUI (Rust / egui) — required
+msc-helper-gui/                  GUI (Rust / egui) — required
 assets/                          HUD reference images + info icon
 build_executable.bat             Windows PyInstaller build
 run_source.bat                   Launch packaged exe or source entry
@@ -129,7 +129,7 @@ VERSION                          Release version
 
 ## Architecture
 
-- **Rust GUI** — only primary interface (settings, status, activity log).
+- **Rust GUI** — only user interface (settings, status, activity log).
 - **Python** — detector, worker, settings persistence, control server, **game overlay**.
 
 ## Known limitations

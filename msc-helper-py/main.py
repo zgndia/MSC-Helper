@@ -1,7 +1,7 @@
 """MSC Helper entry point.
 
 PyInstaller and source runs start here (``main.py``).
-Backend logic lives under ``msc_helper/``; primary UI is the Rust GUI.
+Backend logic lives under ``msc_helper/``; UI is the Rust GUI.
 """
 from __future__ import annotations
 
@@ -83,7 +83,7 @@ def main() -> None:
         raise SystemExit("Administrator privileges were not granted.")
 
     enable_dpi_awareness()
-    # Primary UI is always the Rust GUI. Tk root stays hidden (overlay + backend only).
+    # UI is always the Rust GUI. Tk root stays hidden (overlay + backend only).
     root = tk.Tk()
     root.withdraw()
     try:

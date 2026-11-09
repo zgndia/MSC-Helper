@@ -1,4 +1,4 @@
-# MSC Helper – primary GUI (Rust / egui)
+# MSC Helper – GUI (Rust / egui)
 
 The Python process runs headless in the background (detector, auto-pot / auto-cast worker, control server, and the separate game overlay).
 
@@ -11,7 +11,7 @@ MSCHelper.exe  (PyInstaller onefile)  or  python msc-helper-py/main.py
  │    · MonitorWorker (pots, auto-cast)
  │    · control server on 127.0.0.1:17890
  │    · game overlay (separate lightweight window)
- └─ msc-helper-gui.exe  (this crate – primary settings / status UI)
+ └─ msc-helper-gui.exe  (this crate – settings / status UI)
 ```
 
 The Rust GUI talks to Python over HTTP:
@@ -51,7 +51,7 @@ The script builds this crate when `cargo` is available (or picks up a pre-built
 as a sidecar.
 
 A Rust binary **is required** at runtime. If it is missing, the helper shows an
-error and exits — there is no alternate primary UI.
+error and exits — there is no alternate UI.
 
 ## Theme / layout
 

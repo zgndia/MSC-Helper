@@ -1,4 +1,4 @@
-//! MSC Helper – primary GUI rewritten in Rust (egui).
+//! MSC Helper – GUI rewritten in Rust (egui).
 //! Talks to the existing Python backend over a tiny local HTTP control plane.
 //! Overlay and all backend logic remain in Python.
 

@@ -114,7 +114,7 @@ class MapleHelperApp(AppUIMixin, AppUpdatesMixin):
         self._latest_telemetry: dict[str, Any] = {}
         self._recent_log_lines: list[str] = []
         self._rust_gui_proc: subprocess.Popen | None = None
-        # Primary UI is the Rust GUI only. The Tk root stays hidden and only
+        # UI is the Rust GUI only. The Tk root stays hidden and only
         # drives the overlay + worker timers. The old Tk notebook UI is not shown.
         self._rust_gui_mode = True
         try:
@@ -129,7 +129,7 @@ class MapleHelperApp(AppUIMixin, AppUpdatesMixin):
         self._build_styles()
         self._build_ui()
         self.overlay = GameOverlay(self)
-        # Control plane for the Rust primary GUI (127.0.0.1:17890).
+        # Control plane for the Rust GUI (127.0.0.1:17890).
         try:
             from control_server import ControlServer
             self._control_server = ControlServer(self)
@@ -866,7 +866,7 @@ class MapleHelperApp(AppUIMixin, AppUpdatesMixin):
         widget.configure(state="disabled")
 
     def _start_rust_gui(self) -> None:
-        """Launch the bundled / nearby Rust primary GUI once the control plane is ready."""
+        """Launch the bundled / nearby Rust GUI once the control plane is ready."""
         if self._rust_gui_proc is not None:
             return
         # Ensure Tk stays invisible for the whole session.
@@ -878,20 +878,20 @@ class MapleHelperApp(AppUIMixin, AppUpdatesMixin):
         proc = launch_rust_gui()
         if proc is not None:
             self._rust_gui_proc = proc
-            self._log("Rust primary GUI started.", "success")
+            self._log("Rust GUI started.", "success")
             # When the Rust window is closed, shut down the whole helper
             # (do not pop the Tk window back — that was the dual-GUI bug).
             self.root.after(1000, self._watch_rust_gui)
         else:
             self._log(
-                "Rust GUI binary not found – primary UI is required. Place msc-helper-gui.exe next to the app or under msc-helper-gui/target/release/.",
+                "Rust GUI binary not found – UI is required. Place msc-helper-gui.exe next to the app or under msc-helper-gui/target/release/.",
                 "warning",
             )
             try:
                 import ctypes
                 ctypes.windll.user32.MessageBoxW(
                     None,
-                    "MSC Helper requires the Rust primary GUI (msc-helper-gui.exe).\n\n"
+                    "MSC Helper requires the Rust GUI (msc-helper-gui.exe).\n\n"
                     "Build it with: cd msc-helper-gui && cargo build --release\n"
                     "Or place msc-helper-gui.exe next to MSCHelper.exe.",
                     APP_NAME,

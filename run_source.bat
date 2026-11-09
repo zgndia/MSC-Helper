@@ -1,5 +1,5 @@
 @echo off
-REM Launch MSC Helper with the Rust primary GUI.
+REM Launch MSC Helper with the Rust GUI.
 REM 1. Starts the Python backend in headless-main-window mode.
 REM 2. Starts the Rust GUI (must be built first: cargo build --release).
 

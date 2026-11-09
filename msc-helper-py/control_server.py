@@ -1,5 +1,5 @@
 """
-Minimal local control plane for the Rust primary GUI.
+Minimal local control plane for the Rust GUI.
 
 Runs on 127.0.0.1:17890 and exposes:
   GET  /status   → current telemetry + settings

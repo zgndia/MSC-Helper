@@ -2,7 +2,7 @@
 name = "msc-helper-gui"
 version = "0.1.0"
 edition = "2021"
-description = "MSC Helper primary GUI (Rust / egui) – talks to the Python backend"
+description = "MSC Helper GUI (Rust / egui) – talks to the Python backend"
 authors = ["MSC Helper"]
 
 [dependencies]

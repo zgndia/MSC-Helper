@@ -5,13 +5,13 @@ cd /d "%~dp0"
 echo Building MSC Helper for Windows (windowed, administrator manifest, app icon)...
 echo.
 
-rem ── Locate / build the Rust primary GUI ────────────────────────────────────
+rem ── Locate / build the Rust GUI ────────────────────────────────────
 set "RUST_GUI_EXE="
 
 if exist "msc-helper-gui\Cargo.toml" (
     where cargo >nul 2>&1
     if not errorlevel 1 (
-        echo Building Rust primary GUI ^(msc-helper-gui^)...
+        echo Building Rust GUI ^(msc-helper-gui^)...
         pushd msc-helper-gui
         cargo build --release
         if errorlevel 1 (
@@ -131,7 +131,7 @@ if errorlevel 1 goto :failed
 echo.
 echo Build complete: dist\MSCHelper.exe
 if defined RUST_GUI_EXE (
-    echo Included: msc-helper-gui.exe ^(Rust primary GUI sidecar^)
+    echo Included: msc-helper-gui.exe ^(Rust GUI sidecar^)
     echo On launch the Rust GUI starts automatically; Python stays headless ^(overlay + backend^).
 ) else (
     echo WARNING: No Rust GUI binary was found. MSC Helper requires msc-helper-gui.exe at runtime.
